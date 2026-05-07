@@ -1,0 +1,155 @@
+# claude-bridge
+
+A Chrome extension + native host that exposes your [Claude Code](https://claude.ai/code) cloud sessions as MCP tools — so any local agent can list sessions, read their state, inject prompts, create PRs, and more, all programmatically.
+
+## The Problem
+
+Claude Code cloud sessions run in the browser with no public API. You can start one, but you can't know when it's finished, read its state, or send a follow-up prompt without manually opening a tab. claude-bridge fills that gap.
+
+## Architecture
+
+```
+Local agent (Claude Code / any MCP client)
+    │
+    │  MCP over HTTP (port 7878)
+    ▼
+Daemon (Node.js, always running via launchd)
+    │
+    │  Unix socket → native messaging
+    ▼
+Chrome Extension (background service worker)
+    │
+    │  chrome.tabs messaging
+    ▼
+Content Script (injected into claude.ai)
+    │
+    │  DOM + internal API calls
+    ▼
+claude.ai session
+```
+
+## MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `claude_sessions_list` | List all sessions visible in the sidebar |
+| `claude_session_get_state` | Get state, branch info, CI status, model, and usage % |
+| `claude_session_inject` | Submit a prompt to a session |
+| `claude_session_create` | Open a new session with optional model, effort, and initial prompt |
+| `claude_session_archive` | Archive a session |
+| `claude_session_create_pr` | Click "Create PR" for a session with an open branch |
+| `claude_session_set_ci_options` | Toggle auto-fix CI and auto-merge checkboxes |
+| `claude_session_get_transcript` | Read the full conversation transcript |
+
+Session state values: `running`, `ready`, `merged`, `pr_open`, `pr_closed`
+
+## Requirements
+
+- **macOS** — the daemon runs as a launchd agent (auto-starts on login)
+- **Chrome or Brave**
+- **Node.js** — via [asdf](https://asdf-vm.com/) or a system install
+
+## Installation
+
+**1. Clone the repo**
+
+```bash
+git clone https://github.com/pirateandfox/claude-bridge.git
+cd claude-bridge
+```
+
+**2. Load the extension in Chrome**
+
+- Go to `chrome://extensions`
+- Enable **Developer mode** (top right toggle)
+- Click **Load unpacked** → select the `extension/` folder
+- Copy the **Extension ID** shown on the card (you'll need it in step 3)
+
+**3. Run the install script**
+
+```bash
+./install.sh
+```
+
+The script will prompt you for the extension ID, then:
+- Installs npm dependencies
+- Registers the native messaging host with Chrome (and Brave if present)
+- Writes and loads a launchd plist so the daemon starts automatically on login
+
+**4. Connect Claude Code**
+
+```bash
+claude mcp add claude-bridge http://127.0.0.1:7878/mcp
+```
+
+Or add it manually to `~/.claude.json`:
+
+```json
+"mcpServers": {
+  "claude-bridge": {
+    "url": "http://127.0.0.1:7878/mcp"
+  }
+}
+```
+
+**5. Verify**
+
+```bash
+curl http://127.0.0.1:7878/health
+# → {"ok":true,"chrome":true}
+```
+
+`"chrome": false` means the extension isn't connected yet — make sure the extension is loaded and a claude.ai tab is open.
+
+## Usage
+
+Once installed, the MCP tools are available to any agent connected to `http://127.0.0.1:7878/mcp`. Example workflow:
+
+```
+1. claude_sessions_list          → get session IDs
+2. claude_session_get_state      → check if running/ready
+3. claude_session_inject         → send a follow-up prompt
+4. claude_session_get_state      → poll until state returns to "ready"
+5. claude_session_get_transcript → read the result
+```
+
+## Logs & Debugging
+
+```bash
+tail -f /tmp/claude-bridge.log    # daemon logs
+```
+
+To restart the daemon manually:
+
+```bash
+launchctl unload  ~/Library/LaunchAgents/com.claudebridge.daemon.plist
+launchctl load    ~/Library/LaunchAgents/com.claudebridge.daemon.plist
+```
+
+## Updating
+
+### Auto-updates (via self-hosted .crx)
+
+The extension manifest includes an `update_url` pointing to GitHub Pages. Once you've set up a signed `.crx` and an `updates.xml` file on `gh-pages`, Chrome polls for updates and installs them silently.
+
+See the [releases page](../../releases) for packaged `.crx` files.
+
+### Manual updates
+
+```bash
+git pull
+./install.sh   # re-registers the native host if paths changed
+```
+
+Then reload the extension at `chrome://extensions`.
+
+## Known Limitations
+
+- **macOS only** — the daemon relies on launchd. Linux/Windows support would require swapping the service manager.
+- **claude.ai DOM changes** — Anthropic can rename selectors at any time. Selectors live in `extension/content.js` in a single `SEL` object so updates are one-line fixes.
+- **One claude.ai tab required** — the extension needs at least one claude.ai tab open to relay commands. Opening claude.ai in the background is enough.
+- **Personal use** — Anthropic's consumer ToS restricts automated browser access. This tool is fine for personal agentic workflows. If Anthropic releases an official cloud sessions API, the MCP interface stays identical and only the DOM layer needs to be replaced.
+
+## Contributing
+
+Bug reports and PRs welcome. The most useful contributions are updated selectors when claude.ai's DOM changes — check `extension/content.js:SEL` first.

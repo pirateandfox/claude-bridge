@@ -1,0 +1,13 @@
+{
+  "name": "claude-bridge-host",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "start": "node daemon.js",
+    "install-bridge": "bash ../install.sh"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "express": "^4.18.0"
+  }
+}
