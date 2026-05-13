@@ -15,7 +15,7 @@ let chromeSocket = null;   // single connection from native-host relay
 let chromeBuf    = '';
 const pending    = new Map(); // requestId -> { resolve, reject, timer }
 
-const TIMEOUTS = { inject: 60_000, get_state: 60_000 };
+const TIMEOUTS = { inject: 60_000, get_state: 60_000, warm_sessions: 120_000 };
 
 function sendToChrome(cmd, params = {}) {
   return new Promise((resolve, reject) => {
@@ -78,6 +78,11 @@ const TOOLS = [
   {
     name: 'claude_sessions_list',
     description: 'List all Claude Code cloud sessions visible in the sidebar.',
+    inputSchema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'claude_sessions_warm',
+    description: 'Pre-load all sessions by clicking through each one. Call this before batch get_state calls — it forces the UI to hydrate branch bars so subsequent reads are reliable. Returns the number of sessions warmed.',
     inputSchema: { type: 'object', properties: {}, required: [] },
   },
   {
@@ -183,6 +188,11 @@ function createMcpServer() {
         case 'claude_sessions_list': {
           const r = await sendToChrome('list_sessions');
           result  = r.sessions;
+          break;
+        }
+        case 'claude_sessions_warm': {
+          const r = await sendToChrome('warm_sessions');
+          result  = { warmed: r.warmed };
           break;
         }
         case 'claude_session_get_state': {

@@ -165,12 +165,60 @@ function findSendButton() {
 async function navigateToSession(sessionId) {
   const row = document.querySelector(`[data-row-key="code:${sessionId}"]`);
   if (!row) throw new Error(`Session not found: ${sessionId}`);
+
   row.querySelector(SEL.rowMainBtn)?.click();
-  // Wait for either branch bar or chat input to appear (up to 3s)
-  for (let i = 0; i < 30; i++) {
+
+  // 1. Wait for the focused row to actually switch to this session (up to 5s)
+  for (let i = 0; i < 50; i++) {
     await sleep(100);
-    if (document.querySelector(SEL.branchBar) || document.querySelector(SEL.chatInput)) return;
+    if (activeSessionId() === sessionId) break;
   }
+
+  // 2. Settle delay — the main panel re-renders after focus shifts;
+  //    on slow connections the branch bar can take several seconds to load.
+  await sleep(1000);
+
+  // 3. Wait for branch bar or chat input to be present (up to 10s more)
+  for (let i = 0; i < 100; i++) {
+    if (document.querySelector(SEL.branchBar) || document.querySelector(SEL.chatInput)) return;
+    await sleep(100);
+  }
+}
+
+// Click through every session row to force the UI to hydrate branch bars.
+// Each click triggers a network fetch; we wait just long enough for focus
+// to shift, then move on.  After the sweep we return to the original session.
+async function warmAllSessions() {
+  const originalId = activeSessionId();
+  const rows = document.querySelectorAll(SEL.sessionRow);
+  let warmed = 0;
+
+  for (const row of rows) {
+    const sid = sessionIdFromKey(row.getAttribute('data-row-key'));
+    if (sid === activeSessionId()) { warmed++; continue; } // already loaded
+
+    row.querySelector(SEL.rowMainBtn)?.click();
+
+    // Wait for focus to shift (up to 2s), then let page start loading
+    for (let i = 0; i < 20; i++) {
+      await sleep(100);
+      if (activeSessionId() === sid) break;
+    }
+    // Brief pause to let the network request fire & branch bar start rendering
+    await sleep(500);
+    warmed++;
+  }
+
+  // Navigate back to original session (or first one if original is gone)
+  if (originalId) {
+    const origRow = document.querySelector(`[data-row-key="code:${originalId}"]`);
+    if (origRow) {
+      origRow.querySelector(SEL.rowMainBtn)?.click();
+      await sleep(300);
+    }
+  }
+
+  return warmed;
 }
 
 async function injectPrompt(text) {
@@ -356,6 +404,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           break;
         }
 
+        case 'warm_sessions': {
+          const count = await withNavLock(() => warmAllSessions());
+          sendResponse({ ok: true, warmed: count });
+          break;
+        }
+
         case 'get_state': {
           const row = document.querySelector(`[data-row-key="code:${msg.sessionId}"]`);
           if (!row) { sendResponse({ ok: false, error: 'Session not found' }); break; }
@@ -364,7 +418,17 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             if (activeSessionId() !== msg.sessionId) {
               await navigateToSession(msg.sessionId);
             }
-            return { branchBar: readBranchBar() };
+            // Branch bar container may appear before its children render;
+            // poll for featureBranch to populate (up to 5s for slow connections).
+            let bb = readBranchBar();
+            if (bb && !bb.featureBranch) {
+              for (let i = 0; i < 50; i++) {
+                await sleep(100);
+                bb = readBranchBar();
+                if (bb.featureBranch) break;
+              }
+            }
+            return { branchBar: bb };
           });
 
           const state = readRowState(row);
