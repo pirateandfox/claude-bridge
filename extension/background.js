@@ -34,7 +34,24 @@ async function onDaemonMessage(msg) {
     const response = await chrome.tabs.sendMessage(tab.id, { cmd, sessionId, ...params });
     send({ requestId, ...response });
   } catch (err) {
-    send({ requestId, ok: false, error: err.message });
+    if (err.message?.toLowerCase().includes('receiving end does not exist')) {
+      try {
+        const tabInfo = await chrome.tabs.get(tab.id);
+        if (tabInfo.discarded) {
+          // Tab is in browser-sleep state — activating it reloads and re-injects content script
+          await chrome.tabs.update(tab.id, { active: true });
+          await new Promise(r => setTimeout(r, 3500));
+        } else {
+          await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
+        }
+        const response = await chrome.tabs.sendMessage(tab.id, { cmd, sessionId, ...params });
+        send({ requestId, ...response });
+      } catch (retryErr) {
+        send({ requestId, ok: false, error: retryErr.message });
+      }
+    } else {
+      send({ requestId, ok: false, error: err.message });
+    }
   }
 }
 
