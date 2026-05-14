@@ -31,8 +31,12 @@ async function onDaemonMessage(msg) {
   const tab = codeTab ?? tabs.find(t => t.active) ?? tabs[0];
 
   try {
-    const response = await chrome.tabs.sendMessage(tab.id, { cmd, sessionId, ...params });
-    send({ requestId, ...response });
+    // Pass requestId so content script responds via chrome.runtime.sendMessage
+    // instead of sendResponse (which is unreliable for long-running async ops
+    // in MV3 — the service worker can lose the message channel).
+    // sendMessage resolves with undefined immediately; the real response
+    // arrives via the onMessage listener below.
+    await chrome.tabs.sendMessage(tab.id, { requestId, cmd, sessionId, ...params });
   } catch (err) {
     if (err.message?.toLowerCase().includes('receiving end does not exist')) {
       try {
@@ -44,8 +48,7 @@ async function onDaemonMessage(msg) {
         } else {
           await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
         }
-        const response = await chrome.tabs.sendMessage(tab.id, { cmd, sessionId, ...params });
-        send({ requestId, ...response });
+        await chrome.tabs.sendMessage(tab.id, { requestId, cmd, sessionId, ...params });
       } catch (retryErr) {
         send({ requestId, ok: false, error: retryErr.message });
       }
@@ -59,9 +62,16 @@ function send(msg) {
   port?.postMessage(msg);
 }
 
-// Forward state-change notifications from content scripts to daemon
+// Handle command responses and proactive state changes from content scripts.
+// Content scripts send results via chrome.runtime.sendMessage (type: 'cmd_response')
+// instead of sendResponse, which avoids MV3 service-worker channel drops.
 chrome.runtime.onMessage.addListener((msg) => {
-  if (msg.type === 'state_change') send(msg);
+  if (msg.type === 'cmd_response') {
+    const { type, ...response } = msg;
+    send(response);
+  } else if (msg.type === 'state_change') {
+    send(msg);
+  }
 });
 
 connect();

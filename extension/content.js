@@ -392,27 +392,37 @@ function withNavLock(fn) {
   return result;
 }
 
+// ── Respond via chrome.runtime.sendMessage instead of sendResponse ──────────
+// In MV3 the service worker can lose the sendResponse channel during long async
+// ops (get_state takes 5-20s of DOM polling).  chrome.runtime.sendMessage
+// reliably wakes the worker even if it was terminated mid-operation.
+function respond(requestId, data) {
+  chrome.runtime.sendMessage({ type: 'cmd_response', requestId, ...data }).catch(() => {});
+}
+
 // ── Message handler ────────────────────────────────────────────────────────────
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg) => {
+  const { requestId } = msg;
+
   (async () => {
     try {
       switch (msg.cmd) {
 
         case 'list_sessions': {
           const sessions = await readSessions();
-          sendResponse({ ok: true, sessions });
+          respond(requestId, { ok: true, sessions });
           break;
         }
 
         case 'warm_sessions': {
           const count = await withNavLock(() => warmAllSessions());
-          sendResponse({ ok: true, warmed: count });
+          respond(requestId, { ok: true, warmed: count });
           break;
         }
 
         case 'get_state': {
           const row = document.querySelector(`[data-row-key="code:${msg.sessionId}"]`);
-          if (!row) { sendResponse({ ok: false, error: 'Session not found' }); break; }
+          if (!row) { respond(requestId, { ok: false, error: 'Session not found' }); break; }
 
           const { branchBar } = await withNavLock(async () => {
             if (activeSessionId() !== msg.sessionId) {
@@ -451,7 +461,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             } catch {}
           }
 
-          sendResponse({
+          respond(requestId, {
             ok: true,
             state,
             branchBar: { ...branchBar, prUrl },
@@ -463,46 +473,49 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         case 'inject':
           if (activeSessionId() !== msg.sessionId) await navigateToSession(msg.sessionId);
           await injectPrompt(msg.prompt);
-          sendResponse({ ok: true });
+          respond(requestId, { ok: true });
           break;
 
         case 'create_session': {
           const sessionId = await createSession();
           if (msg.model || msg.effort) await setModelEffort(msg.model, msg.effort);
           if (msg.prompt) await injectPrompt(msg.prompt);
-          sendResponse({ ok: true, sessionId });
+          respond(requestId, { ok: true, sessionId });
           break;
         }
 
         case 'archive':
           await archiveSession(msg.sessionId);
-          sendResponse({ ok: true });
+          respond(requestId, { ok: true });
           break;
 
         case 'create_pr':
           await createPr(msg.sessionId);
-          sendResponse({ ok: true });
+          respond(requestId, { ok: true });
           break;
 
         case 'set_ci_options':
           await setCiOptions(msg.sessionId, { autofix: msg.autofix, automerge: msg.automerge });
-          sendResponse({ ok: true });
+          respond(requestId, { ok: true });
           break;
 
         case 'get_transcript': {
           const turns = await readTranscript(msg.sessionId, msg.lastN);
-          sendResponse({ ok: true, turns });
+          respond(requestId, { ok: true, turns });
           break;
         }
 
         default:
-          sendResponse({ ok: false, error: `Unknown command: ${msg.cmd}` });
+          respond(requestId, { ok: false, error: `Unknown command: ${msg.cmd}` });
       }
     } catch (err) {
-      sendResponse({ ok: false, error: err.message });
+      respond(requestId, { ok: false, error: err.message });
     }
   })();
-  return true; // keep channel open for async response
+
+  // Don't return true / don't call sendResponse — chrome.tabs.sendMessage
+  // resolves with undefined immediately.  The real result arrives via
+  // chrome.runtime.sendMessage → background's onMessage listener.
 });
 
 // ── Proactive state change notifications ───────────────────────────────────────
