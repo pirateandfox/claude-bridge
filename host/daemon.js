@@ -15,22 +15,81 @@ let chromeSocket = null;   // single connection from native-host relay
 let chromeBuf    = '';
 const pending    = new Map(); // requestId -> { resolve, reject, timer }
 
+// ── Concurrency control ──────────────────────────────────────────────────────
+// Only one request may be in-flight to Chrome at a time. Additional requests
+// queue up; if the queue exceeds MAX_QUEUE the caller gets an immediate
+// "bridge busy" error so agents can back off rather than silently stalling.
+const MAX_QUEUE = 5;
+let   inflightRequest = null;
+const queue           = [];
+
 const TIMEOUTS = { inject: 60_000, get_state: 60_000, warm_sessions: 120_000 };
 
 function sendToChrome(cmd, params = {}) {
   return new Promise((resolve, reject) => {
     if (!chromeSocket) return reject(new Error('Chrome not connected — is the extension loaded and a claude.ai tab open?'));
+    if (queue.length >= MAX_QUEUE) {
+      return reject(new Error(`Bridge is busy (${queue.length} requests queued). Try again shortly.`));
+    }
 
-    const requestId = crypto.randomUUID();
-    const ms = TIMEOUTS[cmd] ?? 30_000;
-    const timer = setTimeout(() => {
-      pending.delete(requestId);
-      reject(new Error('Timed out waiting for Chrome response'));
-    }, ms);
+    const task = { cmd, params, resolve, reject };
 
-    pending.set(requestId, { resolve, reject, timer });
-    chromeSocket.write(JSON.stringify({ requestId, cmd, ...params }) + '\n');
+    if (inflightRequest) {
+      log(`queuing ${cmd} (${queue.length + 1} in queue, in-flight: ${inflightRequest.cmd})`);
+      queue.push(task);
+    } else {
+      dispatchTask(task);
+    }
   });
+}
+
+function dispatchTask(task) {
+  inflightRequest = task;
+
+  const requestId = crypto.randomUUID();
+  const ms = TIMEOUTS[task.cmd] ?? 30_000;
+  let settled = false;
+
+  const finish = (settler) => (value) => {
+    if (settled) return;          // idempotent — timeout vs response race
+    settled = true;
+    clearTimeout(timer);
+    pending.delete(requestId);
+    inflightRequest = null;
+    settler(value);
+    drainQueue();
+  };
+
+  const timer = setTimeout(() => {
+    finish(task.reject)(new Error(`Timed out waiting for Chrome response (${task.cmd})`));
+  }, ms);
+
+  pending.set(requestId, { resolve: finish(task.resolve), reject: finish(task.reject), timer });
+  chromeSocket.write(JSON.stringify({ requestId, cmd: task.cmd, ...task.params }) + '\n');
+}
+
+function drainQueue() {
+  if (inflightRequest || queue.length === 0) return;
+  const next = queue.shift();
+  if (!chromeSocket) {
+    next.reject(new Error('Chrome disconnected while queued'));
+    drainQueue();
+    return;
+  }
+  dispatchTask(next);
+}
+
+function flushAllRequests(err) {
+  const entries = [...pending.values()];
+  pending.clear();
+  inflightRequest = null;
+  for (const entry of entries) {
+    clearTimeout(entry.timer);
+    try { entry.reject(err); } catch {}
+  }
+  while (queue.length) {
+    try { queue.shift().reject(err); } catch {}
+  }
 }
 
 function handleChromeMessage(msg) {
@@ -42,9 +101,6 @@ function handleChromeMessage(msg) {
 
   const entry = msg.requestId && pending.get(msg.requestId);
   if (!entry) return;
-
-  clearTimeout(entry.timer);
-  pending.delete(msg.requestId);
 
   if (msg.ok) entry.resolve(msg);
   else        entry.reject(new Error(msg.error ?? 'Chrome returned an error'));
@@ -69,7 +125,11 @@ createNetServer((sock) => {
     }
   });
 
-  sock.on('close', () => { log('native-host relay disconnected'); chromeSocket = null; });
+  sock.on('close', () => {
+    log('native-host relay disconnected');
+    chromeSocket = null;
+    flushAllRequests(new Error('Chrome disconnected'));
+  });
   sock.on('error', (e) => log(`relay socket error: ${e.message}`));
 }).listen(SOCKET_PATH, () => log(`socket listening at ${SOCKET_PATH}`));
 
@@ -286,7 +346,12 @@ app.all('/mcp', async (req, res) => {
   }
 });
 
-app.get('/health', (_req, res) => res.json({ ok: true, chrome: !!chromeSocket }));
+app.get('/health', (_req, res) => res.json({
+  ok: true,
+  chrome: !!chromeSocket,
+  inflight: inflightRequest?.cmd ?? null,
+  queued: queue.length,
+}));
 
 app.listen(MCP_PORT, '127.0.0.1', () =>
   log(`MCP server listening on http://127.0.0.1:${MCP_PORT}/mcp`),

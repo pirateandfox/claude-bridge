@@ -471,31 +471,36 @@ chrome.runtime.onMessage.addListener((msg) => {
         }
 
         case 'inject':
-          if (activeSessionId() !== msg.sessionId) await navigateToSession(msg.sessionId);
-          await injectPrompt(msg.prompt);
+          await withNavLock(async () => {
+            if (activeSessionId() !== msg.sessionId) await navigateToSession(msg.sessionId);
+            await injectPrompt(msg.prompt);
+          });
           respond(requestId, { ok: true });
           break;
 
         case 'create_session': {
-          const sessionId = await createSession();
-          if (msg.model || msg.effort) await setModelEffort(msg.model, msg.effort);
-          if (msg.prompt) await injectPrompt(msg.prompt);
+          const sessionId = await withNavLock(async () => {
+            const sid = await createSession();
+            if (msg.model || msg.effort) await setModelEffort(msg.model, msg.effort);
+            if (msg.prompt) await injectPrompt(msg.prompt);
+            return sid;
+          });
           respond(requestId, { ok: true, sessionId });
           break;
         }
 
         case 'archive':
-          await archiveSession(msg.sessionId);
+          await withNavLock(() => archiveSession(msg.sessionId));
           respond(requestId, { ok: true });
           break;
 
         case 'create_pr':
-          await createPr(msg.sessionId);
+          await withNavLock(() => createPr(msg.sessionId));
           respond(requestId, { ok: true });
           break;
 
         case 'set_ci_options':
-          await setCiOptions(msg.sessionId, { autofix: msg.autofix, automerge: msg.automerge });
+          await withNavLock(() => setCiOptions(msg.sessionId, { autofix: msg.autofix, automerge: msg.automerge }));
           respond(requestId, { ok: true });
           break;
 
