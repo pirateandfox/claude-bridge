@@ -3,7 +3,7 @@
   "name": "claude-bridge",
   "version": "0.1.0",
   "description": "Exposes Claude Code cloud sessions as MCP tools",
-  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA290GFLaew8NDb1F/rgSF+oLxwEKDHRxj5XzdCtZ+xz7pxngnSar670lZVIcoc4GdrY2B0MXqXOYy1739gjHDbJJRctztq/qdc1QU3xbrpaPhA7L2Jlvxgqw9X5aoVNy5YVt8OQdxvmirEGg9Jg9F3+2EiosUVLzw0+Ke2ERDPuUngxEj7WcXzf7tObH4yVYvatgZmsngNzXVeQm3sDimAfqHPV7V2sKvaJ3eB3HhP1lhcOtt2GlGw6Vrcj08LCt9BshyXnZ3UcGx8Vv6CW1zl6FB1AZw9CkTOCtQDEQE0h1/pMpoe80L0axIHFQrehF1Iiml8LwRdo03ICWLmOekBQIDAQAB",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuK3pFAVU3ufi2oP8/RdVaE7r7tbz3ozyCYFh3o9DIpZn8fctf4PhMF8PwNz4tv3VLr+RYtXBGEs7b8t3I4ucq0AhaPPqV6yjvK0y2K5/ebXybLUCDOMx5hVdI0ZkcpawtZRLNMnyO2fWHNPcwD6dwXKtQeDqZ+FRU5LQSJr+xgt+UGYJV87Xlrk1MUG6kTxZWpxrObRbsoHVEbI+oWvNuqAxqTQo/eo+86Dmo0JpEybTYrKjENN63IRziHWitP8IrJgkSmCKJijKPmUh0g5Aihwf+L6DfFDNyp4ML5zOcvqnA+HgtjE7KqxkISZvb968cnBZu6N+vK3anvxjg8zEBwIDAQAB",
   "update_url": "https://pirateandfox.github.io/claude-bridge/updates.xml",
   "icons": {
     "16":  "icons/icon16.png",
