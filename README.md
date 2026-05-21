@@ -13,7 +13,7 @@ Local agent (Claude Code / any MCP client)
     │
     │  MCP over HTTP (port 7878)
     ▼
-Daemon (Node.js, always running via launchd)
+Daemon (Node.js, always running via launchd/systemd)
     │
     │  Unix socket → native messaging
     ▼
@@ -45,9 +45,10 @@ Session state values: `running`, `ready`, `merged`, `pr_open`, `pr_closed`
 
 ## Requirements
 
-- **macOS** — the daemon runs as a launchd agent (auto-starts on login)
-- **Chrome or Brave**
+- **macOS or Linux** — the daemon runs via launchd on macOS or systemd on Linux
+- **Chrome, Chromium, or Brave**
 - **Node.js** — via [asdf](https://asdf-vm.com/) or a system install
+- **sudo** on Linux — required to install the systemd service
 
 ## Installation
 
@@ -73,8 +74,8 @@ cd claude-bridge
 
 The script will prompt you for the extension ID, then:
 - Installs npm dependencies
-- Registers the native messaging host with Chrome (and Brave if present)
-- Writes and loads a launchd plist so the daemon starts automatically on login
+- Registers the native messaging host with detected browser profiles
+- Writes and loads a launchd plist on macOS, or a systemd service on Linux
 
 **4. Connect Claude Code**
 
@@ -121,10 +122,26 @@ tail -f /tmp/claude-bridge.log    # daemon logs
 
 To restart the daemon manually:
 
+macOS:
+
 ```bash
 launchctl unload  ~/Library/LaunchAgents/com.claudebridge.daemon.plist
 launchctl load    ~/Library/LaunchAgents/com.claudebridge.daemon.plist
 ```
+
+Linux:
+
+```bash
+sudo systemctl restart claude-bridge.service
+```
+
+## Linux Agent Nodes
+
+On a headless Linux box, Chrome must run inside the virtual display with the extension loaded and at least one `claude.ai` tab open for `/health` to report `"chrome": true`. The daemon itself has no display dependency, but the end-to-end bridge does.
+
+Run the daemon as the same user that owns the Chrome profile, for example `pf`. Native messaging hosts are spawned by Chrome as that user, and the manifest must live in that user's browser profile directory under `~/.config/.../NativeMessagingHosts/`.
+
+For fleet images, keep the unpacked extension ID stable by adding a fixed `"key"` field to `extension/manifest.json`. Generate one keypair, bake the public key into the manifest, and every cloned appliance will use the same extension ID for the native-host `allowed_origins` entry.
 
 ## Updating
 
@@ -145,7 +162,7 @@ Then reload the extension at `chrome://extensions`.
 
 ## Known Limitations
 
-- **macOS only** — the daemon relies on launchd. Linux/Windows support would require swapping the service manager.
+- **Windows not supported** — Windows would require registry-based native-host registration and a Windows service wrapper.
 - **claude.ai DOM changes** — Anthropic can rename selectors at any time. Selectors live in `extension/content.js` in a single `SEL` object so updates are one-line fixes.
 - **One claude.ai tab required** — the extension needs at least one claude.ai tab open to relay commands. Opening claude.ai in the background is enough.
 - **Personal use** — Anthropic's consumer ToS restricts automated browser access. This tool is fine for personal agentic workflows. If Anthropic releases an official cloud sessions API, the MCP interface stays identical and only the DOM layer needs to be replaced.
