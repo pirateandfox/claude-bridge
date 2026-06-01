@@ -1,9 +1,33 @@
 const HOST_NAME = 'com.claudebridge.host';
+const KEEPALIVE_ALARM = 'claude-bridge-keepalive';
+const RECONNECT_DELAY_MS = 2000;
 
 let port = null;
+let reconnectTimer = null;
 
-function connect() {
-  port = chrome.runtime.connectNative(HOST_NAME);
+function isClaudeUrl(url) {
+  return typeof url === 'string' && url.startsWith('https://claude.ai/');
+}
+
+function scheduleReconnect(reason) {
+  if (reconnectTimer) return;
+
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    ensureConnected(reason);
+  }, RECONNECT_DELAY_MS);
+}
+
+function ensureConnected(reason = 'startup') {
+  if (port) return;
+
+  try {
+    port = chrome.runtime.connectNative(HOST_NAME);
+  } catch (err) {
+    console.warn(`[claude-bridge] failed to connect native host (${reason}): ${err.message}`);
+    scheduleReconnect('connect-error');
+    return;
+  }
 
   port.onMessage.addListener(onDaemonMessage);
 
@@ -11,10 +35,21 @@ function connect() {
     const err = chrome.runtime.lastError?.message ?? 'unknown';
     console.warn(`[claude-bridge] native host disconnected: ${err}. Reconnecting in 2s...`);
     port = null;
-    setTimeout(connect, 2000);
+    scheduleReconnect('disconnect');
   });
 
-  console.log('[claude-bridge] connected to native host');
+  console.log(`[claude-bridge] connected to native host (${reason})`);
+}
+
+async function ensureKeepaliveAlarm() {
+  await chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 1 });
+}
+
+function wake(reason) {
+  ensureConnected(reason);
+  ensureKeepaliveAlarm().catch((err) => {
+    console.warn(`[claude-bridge] failed to create keepalive alarm: ${err.message}`);
+  });
 }
 
 async function onDaemonMessage(msg) {
@@ -71,7 +106,29 @@ chrome.runtime.onMessage.addListener((msg) => {
     send(response);
   } else if (msg.type === 'state_change') {
     send(msg);
+  } else if (msg.type === 'content_ready') {
+    wake('content-ready');
   }
 });
 
-connect();
+chrome.runtime.onStartup.addListener(() => wake('runtime-startup'));
+chrome.runtime.onInstalled.addListener(() => wake('runtime-installed'));
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === KEEPALIVE_ALARM) wake('keepalive-alarm');
+});
+
+chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
+  if (isClaudeUrl(changeInfo.url) || isClaudeUrl(tab.url)) {
+    wake('claude-tab-updated');
+  }
+});
+
+chrome.tabs.onActivated.addListener(async ({ tabId }) => {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (isClaudeUrl(tab.url)) wake('claude-tab-activated');
+  } catch {}
+});
+
+wake('service-worker-startup');

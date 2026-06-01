@@ -559,3 +559,7 @@ if (document.querySelector(SEL.sessionRow)) {
   });
   boot.observe(document.body, { childList: true, subtree: true });
 }
+
+try {
+  chrome.runtime.sendMessage({ type: 'content_ready', url: location.href }).catch(() => {});
+} catch {}

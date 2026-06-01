@@ -15,7 +15,8 @@
     "nativeMessaging",
     "tabs",
     "scripting",
-    "clipboardWrite"
+    "clipboardWrite",
+    "alarms"
   ],
   "host_permissions": ["https://claude.ai/*"],
   "background": {
