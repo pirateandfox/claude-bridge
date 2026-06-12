@@ -2,3 +2,4 @@ node_modules/
 .claude/**
 host/run-native-host.sh
 key.pem
+.codex/
