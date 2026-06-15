@@ -357,7 +357,7 @@ app.listen(MCP_PORT, '127.0.0.1', () =>
   log(`MCP server listening on http://127.0.0.1:${MCP_PORT}/mcp`),
 );
 
-function log(msg) { process.stderr.write(`[daemon] ${msg}\n`); }
+function log(msg) { process.stderr.write(`[daemon ${new Date().toISOString().slice(11, 23)}] ${msg}\n`); }
 
 process.on('SIGTERM', () => { log('SIGTERM received, exiting'); process.exit(0); });
 process.on('SIGINT',  () => { log('SIGINT received, exiting');  process.exit(0); });

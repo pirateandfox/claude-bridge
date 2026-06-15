@@ -39,6 +39,7 @@ function ensureConnected(reason = 'startup') {
   });
 
   console.log(`[claude-bridge] connected to native host (${reason})`);
+  flushOutbox();
 }
 
 async function ensureKeepaliveAlarm() {
@@ -93,8 +94,27 @@ async function onDaemonMessage(msg) {
   }
 }
 
+// Durable outbox: if the native port is momentarily down (worker respawn /
+// reconnect in progress), buffer outgoing messages and flush on reconnect
+// instead of silently dropping them.
+const outbox = [];
+const OUTBOX_MAX = 200;
+
 function send(msg) {
-  port?.postMessage(msg);
+  if (port) {
+    try { port.postMessage(msg); return; }
+    catch (e) { /* fall through to buffering */ }
+  }
+  if (outbox.length < OUTBOX_MAX) outbox.push(msg);
+  ensureConnected('send-buffered');
+}
+
+function flushOutbox() {
+  if (!port) return;
+  while (outbox.length) {
+    const m = outbox.shift();
+    try { port.postMessage(m); } catch (e) { outbox.unshift(m); break; }
+  }
 }
 
 // Handle command responses and proactive state changes from content scripts.

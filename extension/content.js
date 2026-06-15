@@ -83,17 +83,31 @@ function readBranchBar() {
   const bar = document.querySelector(SEL.branchBar);
   if (!bar) return null;
 
-  // PR button: aria-label is "PR not yet created" | "#N · Open" | "#N · Merged"
-  const prBtn   = bar.querySelector('button[aria-label]');
-  const prLabel = prBtn?.getAttribute('aria-label') ?? '';
-  let prState = 'none', prNumber = null;
-  const m = prLabel.match(/#(\d+) · (.+)/);
-  if (m) { prNumber = +m[1]; prState = m[2].toLowerCase(); }
+  // PR info. The branch row shows a "#N" link to the GitHub PR plus a
+  // role="img" status icon ("Open" | "Merged" | "Closed" | "Draft"). (Older
+  // markup carried this on a button[aria-label="#N · State"], which is gone — so
+  // the previous selector silently reported every PR as "none".)
+  let prState = 'none', prNumber = null, prUrl = null;
+  const prLink = bar.querySelector('a[href*="/pull/"]');
+  if (prLink) {
+    prUrl = prLink.getAttribute('href');
+    const nm = (prLink.textContent || '').match(/#(\d+)/) || prUrl.match(/\/pull\/(\d+)/);
+    if (nm) prNumber = +nm[1];
+    const statusLabel = bar.querySelector('[role="img"][aria-label]')?.getAttribute('aria-label')?.trim().toLowerCase();
+    prState = statusLabel || 'open';
+  }
 
-  // Branch names
-  const branchBtns    = bar.querySelectorAll(`${SEL.branchFlow} button`);
-  const baseBranch    = branchBtns[0]?.textContent?.trim() ?? null;
-  const featureBranch = branchBtns[1]?.querySelector('.truncate')?.textContent?.trim() ?? null;
+  // Branch flow renders as [base/repo] → [feature branch]. The feature (working)
+  // branch is the button inside .epitaxy-branch-flow (it carries the .truncate);
+  // the base/repo is the branch button that precedes the flow. (The flow used to
+  // hold both buttons — base at [0], feature at [1] — but now holds only the
+  // feature, with the base hoisted out as a sibling. Read both off the full
+  // button list, excluding the PR button which is the only one with aria-label.)
+  const flowBtn       = bar.querySelector(`${SEL.branchFlow} button`);
+  const featureBranch = (flowBtn?.querySelector('.truncate')?.textContent ?? flowBtn?.textContent ?? '').trim() || null;
+  const branchBtns    = [...bar.querySelectorAll('button')].filter(b => !b.getAttribute('aria-label'));
+  const baseBtn       = branchBtns.find(b => b !== flowBtn);
+  const baseBranch    = (baseBtn?.querySelector('.truncate')?.textContent ?? baseBtn?.textContent ?? '').trim() || null;
 
   // Diff stats
   const diffText  = bar.querySelector(SEL.diffSrOnly)?.textContent ?? '';
@@ -109,7 +123,7 @@ function readBranchBar() {
     :                                                    'pending')
     : null;
 
-  return { prState, prNumber, baseBranch, featureBranch, additions, deletions, ciState };
+  return { prState, prNumber, prUrl, baseBranch, featureBranch, additions, deletions, ciState };
 }
 
 function readModelEffortUsage() {
@@ -168,21 +182,16 @@ async function navigateToSession(sessionId) {
 
   row.querySelector(SEL.rowMainBtn)?.click();
 
-  // 1. Wait for the focused row to actually switch to this session (up to 5s)
-  for (let i = 0; i < 50; i++) {
-    await sleep(100);
-    if (activeSessionId() === sessionId) break;
-  }
+  // 1. Wait for the focused row to actually switch to this session.
+  await pollUntil(() => activeSessionId() === sessionId, 4000);
 
-  // 2. Settle delay — the main panel re-renders after focus shifts;
-  //    on slow connections the branch bar can take several seconds to load.
-  await sleep(1000);
-
-  // 3. Wait for branch bar or chat input to be present (up to 10s more)
-  for (let i = 0; i < 100; i++) {
-    if (document.querySelector(SEL.branchBar) || document.querySelector(SEL.chatInput)) return;
-    await sleep(100);
-  }
+  // 2. Wait for the branch bar or chat input to render. (Bounded by wall-clock
+  //    so a throttled background tab can't stretch this past the daemon
+  //    timeout — see pollUntil.)
+  await pollUntil(
+    () => document.querySelector(SEL.branchBar) || document.querySelector(SEL.chatInput),
+    6000,
+  );
 }
 
 // Click through every session row to force the UI to hydrate branch bars.
@@ -199,12 +208,9 @@ async function warmAllSessions() {
 
     row.querySelector(SEL.rowMainBtn)?.click();
 
-    // Wait for focus to shift (up to 2s), then let page start loading
-    for (let i = 0; i < 20; i++) {
-      await sleep(100);
-      if (activeSessionId() === sid) break;
-    }
-    // Brief pause to let the network request fire & branch bar start rendering
+    // Wait for focus to shift, then let page start loading. Wall-clock bounded
+    // so a throttled background tab doesn't stretch the per-session wait.
+    await pollUntil(() => activeSessionId() === sid, 2000);
     await sleep(500);
     warmed++;
   }
@@ -385,6 +391,42 @@ async function setCiOptions(sessionId, { autofix, automerge }) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// Throttle-immune wait. Resolves true as soon as predicate() is satisfied, or
+// false after maxMs.
+//
+// Why not a setTimeout poll loop: Chrome heavily throttles setTimeout/setInterval
+// in BACKGROUND tabs (a 100ms timer can fire at ~1s, or ~1/min when the tab has
+// been hidden for minutes). The claude.ai tab is almost always backgrounded when
+// the bridge drives it, so timer-based polling ballooned to ~50s and blew the
+// daemon's 60s timeout. But DOM mutations caused by network responses / React
+// renders are NOT throttled — the branch bar still appears the moment its data
+// lands. So we drive the wait off a MutationObserver (fires synchronously on the
+// real DOM change) and use timers only as a coarse give-up backstop.
+function pollUntil(predicate, maxMs) {
+  return new Promise((resolve) => {
+    if (predicate()) return resolve(true);
+    let done = false;
+    const deadline = Date.now() + maxMs;
+    let obs, iv, timer;
+    const finish = (val) => {
+      if (done) return;
+      done = true;
+      if (obs) obs.disconnect();
+      clearInterval(iv);
+      clearTimeout(timer);
+      resolve(val);
+    };
+    const check = () => {
+      if (predicate()) finish(true);
+      else if (Date.now() >= deadline) finish(false);
+    };
+    obs = new MutationObserver(check);
+    obs.observe(document.documentElement, { childList: true, subtree: true, attributes: true, characterData: true });
+    iv = setInterval(check, 200);                 // backstop (throttled in bg, harmless)
+    timer = setTimeout(() => finish(false), maxMs); // coarse deadline backstop
+  });
+}
+
 let navLock = Promise.resolve();
 function withNavLock(fn) {
   const result = navLock.then(fn);
@@ -429,42 +471,25 @@ chrome.runtime.onMessage.addListener((msg) => {
               await navigateToSession(msg.sessionId);
             }
             // Branch bar container may appear before its children render;
-            // poll for featureBranch to populate (up to 5s for slow connections).
+            // briefly wait for featureBranch to populate. Wall-clock bounded so
+            // a throttled background tab can't stretch this to ~50s (the old
+            // 50-iteration loop did exactly that and blew the daemon timeout).
             let bb = readBranchBar();
             if (bb && !bb.featureBranch) {
-              for (let i = 0; i < 50; i++) {
-                await sleep(100);
-                bb = readBranchBar();
-                if (bb.featureBranch) break;
-              }
+              await pollUntil(() => (bb = readBranchBar()) && bb.featureBranch, 800);
             }
             return { branchBar: bb };
           });
 
           const state = readRowState(row);
 
-          let prUrl = null;
-          if (branchBar?.prNumber) {
-            try {
-              const sr = await fetch(`/v1/sessions/${msg.sessionId}`, {
-                credentials: 'include',
-                headers: {
-                  'anthropic-beta':    'managed-agents-2026-04-01',
-                  'anthropic-version': '2023-06-01',
-                },
-              });
-              if (sr.ok) {
-                const sd = await sr.json();
-                const repo = sd.session_context?.outcomes?.[0]?.git_info?.repo ?? null;
-                if (repo) prUrl = `https://github.com/${repo}/pull/${branchBar.prNumber}`;
-              }
-            } catch {}
-          }
-
+          // prUrl now comes straight off the PR link in readBranchBar — no need
+          // for the old /v1/sessions fetch (which had no timeout and could itself
+          // hang the call under the same background-tab conditions).
           respond(requestId, {
             ok: true,
             state,
-            branchBar: { ...branchBar, prUrl },
+            branchBar,
             ...readModelEffortUsage(),
           });
           break;
@@ -560,6 +585,19 @@ if (document.querySelector(SEL.sessionRow)) {
   boot.observe(document.body, { childList: true, subtree: true });
 }
 
-try {
-  chrome.runtime.sendMessage({ type: 'content_ready', url: location.href }).catch(() => {});
-} catch {}
+// Nudge the background worker to (re)connect the native host. The MV3 service
+// worker can be suspended and lose its native port; when that happens nothing
+// reconnects on its own and the bridge goes stuck-disconnected (chrome:false).
+// The content script lives with the page, so it can keep poking the worker
+// awake. 'content_ready' triggers wake()/ensureConnected() in background.js.
+function pokeWake() {
+  try { chrome.runtime.sendMessage({ type: 'content_ready', url: location.href }).catch(() => {}); } catch {}
+}
+
+pokeWake();
+// Periodic heartbeat. setInterval is throttled in a background tab, but even a
+// coarse ~1/min tick is enough to recover a dropped connection automatically.
+setInterval(pokeWake, 15000);
+// Reconnect promptly the moment the tab becomes visible or regains focus.
+document.addEventListener('visibilitychange', () => { if (!document.hidden) pokeWake(); });
+window.addEventListener('focus', pokeWake);
