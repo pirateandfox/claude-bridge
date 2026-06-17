@@ -23,7 +23,7 @@ const MAX_QUEUE = 5;
 let   inflightRequest = null;
 const queue           = [];
 
-const TIMEOUTS = { inject: 60_000, get_state: 60_000, warm_sessions: 120_000 };
+const TIMEOUTS = { inject: 60_000, get_state: 60_000, warm_sessions: 120_000, create_session: 60_000 };
 
 function sendToChrome(cmd, params = {}) {
   return new Promise((resolve, reject) => {
@@ -170,15 +170,16 @@ const TOOLS = [
   },
   {
     name: 'claude_session_create',
-    description: 'Open a new Claude Code session with optional model, effort level, and initial prompt.',
+    description: 'Open a new Claude Code session. A repo and an initial prompt are required: clicking "New session" only opens a blank composer, and the session is created when the prompt is submitted against the chosen repo.',
     inputSchema: {
       type: 'object',
       properties: {
-        prompt: { type: 'string',  description: 'Initial prompt to send after creating the session' },
+        repo:   { type: 'string',  description: 'Repository to run the session against, "owner/name" (e.g. "pirateandfox/claude-bridge"). Must match a repo in the picker.' },
+        prompt: { type: 'string',  description: 'Initial prompt to send — this is what creates the session' },
         model:  { type: 'string',  description: 'Model name e.g. "Opus 4.7", "Sonnet 4.6", "Haiku 4.5"' },
         effort: { type: 'string',  description: '"Low" | "Medium" | "High" | "Max"' },
       },
-      required: [],
+      required: ['repo', 'prompt'],
     },
   },
   {
@@ -266,7 +267,7 @@ function createMcpServer() {
           break;
         }
         case 'claude_session_create': {
-          const r = await sendToChrome('create_session', { model: args.model, effort: args.effort, prompt: args.prompt });
+          const r = await sendToChrome('create_session', { repo: args.repo, model: args.model, effort: args.effort, prompt: args.prompt });
           result  = { sessionId: r.sessionId };
           break;
         }

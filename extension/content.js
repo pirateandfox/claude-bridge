@@ -12,6 +12,9 @@ const SEL = {
   chatInput:     'div[contenteditable="true"][aria-label="Prompt"]',
   sendBtn:       'button[aria-label="Send"]',
   usageBtn:      '[aria-label^="Usage:"]',
+  repoTrigger:   'button[role="combobox"][aria-label="Add repository"]',  // "Select repo…" on a new session
+  repoOption:    '[role="option"]',                                       // repo entries in the open picker
+  repoSearch:    'input[placeholder="Search repos…"]',               // type-to-filter input (… is U+2026)
 };
 
 function sessionIdFromKey(rowKey) {
@@ -157,6 +160,13 @@ function activeSessionId() {
   return row ? sessionIdFromKey(row.getAttribute('data-row-key')) : null;
 }
 
+// A brand-new session has no focused row until its first prompt is submitted —
+// the only reliable handle is the URL claude.ai navigates to: /code/session_XXX.
+function sessionIdFromUrl() {
+  const m = location.pathname.match(/\/code\/(session_[A-Za-z0-9]+)/);
+  return m ? m[1] : null;
+}
+
 function findSendButton() {
   // Primary: known aria-label from DOM research
   const known = document.querySelector(SEL.sendBtn);
@@ -259,15 +269,71 @@ async function injectPrompt(text) {
   send.dispatchEvent(new MouseEvent('click',     { bubbles: true, cancelable: true }));
 }
 
-async function createSession() {
-  for (const btn of document.querySelectorAll(SEL.rowMainBtn)) {
-    if (btn.textContent?.includes('New session')) {
-      btn.click();
-      await sleep(1200);
-      return activeSessionId();
-    }
+// Pick a repo in the new-session picker. A code session can no longer be created
+// without one — clicking "New session" opens a composer with an empty
+// "Select repo…" combobox, and submitting a prompt with no repo is a no-op.
+async function selectRepo(repo) {
+  const trigger = document.querySelector(SEL.repoTrigger);
+  if (!trigger) throw new Error('Repo picker not found — claude.ai UI may have changed');
+
+  trigger.click();
+  await pollUntil(() => document.querySelectorAll(SEL.repoOption).length > 0, 3000);
+
+  // Best-effort type-to-filter (the list is long and may virtualize on other
+  // accounts). Harmless when all options are already in the DOM.
+  const search = document.querySelector(SEL.repoSearch) || document.querySelector('input[type="text"]');
+  if (search) {
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+    setter.call(search, repo);
+    search.dispatchEvent(new Event('input', { bubbles: true }));
+    await pollUntil(
+      () => [...document.querySelectorAll(SEL.repoOption)].some(o => o.textContent?.trim() === repo),
+      2000,
+    );
   }
-  throw new Error('New session button not found');
+
+  const norm    = s => (s || '').trim();
+  const options = [...document.querySelectorAll(SEL.repoOption)];
+  const match   = options.find(o => norm(o.textContent) === repo)
+               || options.find(o => norm(o.textContent).toLowerCase() === repo.toLowerCase())
+               || options.find(o => norm(o.textContent).endsWith(`/${repo}`));   // allow bare repo name
+  if (!match) throw new Error(`Repo "${repo}" not found in picker`);
+
+  match.click();
+  // Wait for the picker to close (combobox collapses) before continuing.
+  await pollUntil(() => document.querySelector(SEL.repoTrigger)?.getAttribute('aria-expanded') !== 'true', 2000);
+}
+
+// Create a new session. Clicking "New session" only opens a blank composer; the
+// session itself is created server-side when the first prompt is submitted, and
+// its ID then appears in the URL. So the order is: open composer → pick repo →
+// set model/effort → submit prompt → read the new ID from the URL.
+async function createSession({ model, effort, prompt, repo } = {}) {
+  if (!prompt) throw new Error('A prompt is required to create a session');
+
+  let newBtn = null;
+  for (const btn of document.querySelectorAll(SEL.rowMainBtn)) {
+    if (btn.textContent?.includes('New session')) { newBtn = btn; break; }
+  }
+  if (!newBtn) throw new Error('New session button not found');
+
+  newBtn.click();
+  // Wait for the blank composer to render (URL drops the previous session id).
+  await pollUntil(() => document.querySelector(SEL.chatInput), 5000);
+
+  // A repo is now mandatory when the picker is present.
+  if (document.querySelector(SEL.repoTrigger)) {
+    if (!repo) throw new Error('A repo is required to create a session (e.g. "owner/name")');
+    await selectRepo(repo);
+  }
+
+  if (model || effort) await setModelEffort(model, effort);
+
+  await injectPrompt(prompt);          // submitting is what actually creates the session
+
+  // The new session id only exists after submit; it lands in the URL.
+  await pollUntil(() => sessionIdFromUrl(), 15000);
+  return sessionIdFromUrl();
 }
 
 async function setModelEffort(model, effort) {
@@ -504,12 +570,12 @@ chrome.runtime.onMessage.addListener((msg) => {
           break;
 
         case 'create_session': {
-          const sessionId = await withNavLock(async () => {
-            const sid = await createSession();
-            if (msg.model || msg.effort) await setModelEffort(msg.model, msg.effort);
-            if (msg.prompt) await injectPrompt(msg.prompt);
-            return sid;
-          });
+          const sessionId = await withNavLock(() => createSession({
+            model:  msg.model,
+            effort: msg.effort,
+            prompt: msg.prompt,
+            repo:   msg.repo,
+          }));
           respond(requestId, { ok: true, sessionId });
           break;
         }
