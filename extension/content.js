@@ -91,15 +91,19 @@ async function readSessions() {
     if (resp.status === 401 || resp.status === 403) throw new Error('NOT_AUTHENTICATED');
     if (!resp.ok) throw new Error(`Sessions API ${resp.status}`);
     const data = await resp.json();
-    console.log('[claude-bridge] sessions API sample:', JSON.stringify(data.data?.[0], null, 2));
     const apiSessions = (data.data ?? []).map(s => ({
       sessionId: s.id,
       title:     s.title ?? '',
       state:     s.session_status ?? 'ready',
       repo:      s.session_context?.outcomes?.[0]?.git_info?.repo ?? null,
     }));
-    // If API returns results, use them; otherwise fall through to DOM
-    if (apiSessions.length > 0) return apiSessions;
+    // Trust the API result even when it's empty: an authenticated account with
+    // zero sessions is a real, valid state. (Previously an empty result fell
+    // through to the DOM scrape, conflating "0 sessions" with "API failed" and
+    // making a blank list ambiguous.) The DOM fallback is only for an actual API
+    // failure (timeout / network / non-OK status).
+    console.log(`[claude-bridge] sessions API ok — ${apiSessions.length} session(s)`);
+    return apiSessions;
   } catch (e) {
     // Auth failure is a real, user-fixable condition — propagate it verbatim so
     // the agent sees "log in", not an empty list. Everything else (timeout,
@@ -108,8 +112,10 @@ async function readSessions() {
       throw new Error('Not signed in to claude.ai in the bridge browser. Open https://claude.ai/code in that Chrome profile, log in, then retry.');
     }
     console.log('[claude-bridge] sessions API failed, using DOM fallback:', e.message);
+    const domSessions = readSessionsFromDom();
+    console.log(`[claude-bridge] DOM fallback — ${domSessions.length} session(s)`);
+    return domSessions;
   }
-  return readSessionsFromDom();
 }
 
 function readBranchBar() {
