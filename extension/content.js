@@ -56,6 +56,14 @@ function readSessionsFromDom() {
   return sessions;
 }
 
+// Relay a diagnostic line to the daemon log (/tmp/claude-bridge.log) so the fleet
+// is debuggable without opening the headless browser's console — that log is the
+// one artifact an operator can actually read on a remote box. Best-effort.
+function relayLog(msg) {
+  try { chrome.runtime.sendMessage({ type: 'log', msg }); } catch {}
+  console.log('[claude-bridge] ' + msg);
+}
+
 // fetch() with a hard timeout. claude.ai's in-page API fetches (/v1/sessions,
 // /v1/code/sessions/.../events) have NO built-in timeout, so when the tab sits on
 // an auth wall or the network stalls, the promise never settles — and the command
@@ -102,7 +110,7 @@ async function readSessions() {
     // through to the DOM scrape, conflating "0 sessions" with "API failed" and
     // making a blank list ambiguous.) The DOM fallback is only for an actual API
     // failure (timeout / network / non-OK status).
-    console.log(`[claude-bridge] sessions API ok — ${apiSessions.length} session(s)`);
+    relayLog(`sessions API ok — ${apiSessions.length} session(s)`);
     return apiSessions;
   } catch (e) {
     // Auth failure is a real, user-fixable condition — propagate it verbatim so
@@ -111,9 +119,9 @@ async function readSessions() {
     if (e.message === 'NOT_AUTHENTICATED') {
       throw new Error('Not signed in to claude.ai in the bridge browser. Open https://claude.ai/code in that Chrome profile, log in, then retry.');
     }
-    console.log('[claude-bridge] sessions API failed, using DOM fallback:', e.message);
+    relayLog(`sessions API failed (${e.message}); using DOM fallback`);
     const domSessions = readSessionsFromDom();
-    console.log(`[claude-bridge] DOM fallback — ${domSessions.length} session(s)`);
+    relayLog(`DOM fallback — ${domSessions.length} session(s)`);
     return domSessions;
   }
 }
@@ -676,9 +684,11 @@ chrome.runtime.onMessage.addListener((msg) => {
           // prUrl comes straight off the PR link in readBranchBar — no /v1/sessions
           // fetch needed (that had no timeout and could itself hang under the same
           // background-tab conditions).
+          const gsState = readRowState(row);
+          relayLog(`get_state ${msg.sessionId}: state=${gsState} branch=${scraped.branchBar?.featureBranch ?? 'none'} usagePct=${scraped.usagePct ?? 'n/a'}`);
           respond(requestId, {
             ok: true,
-            state: readRowState(row),
+            state: gsState,
             branchBar: scraped.branchBar,
             model:     scraped.model,
             effort:    scraped.effort,

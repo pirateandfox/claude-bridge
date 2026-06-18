@@ -9,6 +9,14 @@ function isClaudeUrl(url) {
   return typeof url === 'string' && url.startsWith('https://claude.ai/');
 }
 
+// Mirror a diagnostic line into the daemon log (/tmp/claude-bridge.log) as well as
+// the service-worker console, so the fleet is debuggable from the one log file an
+// operator can read on a headless box. Best-effort.
+function diag(msg) {
+  console.log('[claude-bridge] ' + msg);
+  try { send({ type: 'log', msg }); } catch {}
+}
+
 function scheduleReconnect(reason) {
   if (reconnectTimer) return;
 
@@ -58,7 +66,7 @@ async function onDaemonMessage(msg) {
 
   const tabs = await chrome.tabs.query({ url: 'https://claude.ai/*' });
   if (!tabs.length) {
-    console.warn(`[claude-bridge] ${cmd}: no claude.ai tab open (requestId=${requestId})`);
+    diag(`${cmd}: no claude.ai tab open (requestId=${requestId})`);
     send({ requestId, ok: false, error: 'No claude.ai tab is open' });
     return;
   }
@@ -68,7 +76,7 @@ async function onDaemonMessage(msg) {
   const tab = codeTab ?? tabs.find(t => t.active) ?? tabs[0];
   // Logs which tab a command was routed to — a login/interstitial URL here
   // explains a hung command (the in-page API fetch never authenticates).
-  console.log(`[claude-bridge] ${cmd} → tab ${tab.id} ${tab.url} (requestId=${requestId})`);
+  diag(`${cmd} → tab ${tab.id} ${tab.url} (requestId=${requestId})`);
 
   try {
     // Pass requestId so content script responds via chrome.runtime.sendMessage
@@ -79,7 +87,7 @@ async function onDaemonMessage(msg) {
     await chrome.tabs.sendMessage(tab.id, { requestId, cmd, sessionId, ...params });
   } catch (err) {
     if (err.message?.toLowerCase().includes('receiving end does not exist')) {
-      console.warn(`[claude-bridge] ${cmd}: content script not reachable on tab ${tab.id}, re-injecting (requestId=${requestId})`);
+      diag(`${cmd}: content script not reachable on tab ${tab.id}, re-injecting (requestId=${requestId})`);
       try {
         const tabInfo = await chrome.tabs.get(tab.id);
         if (tabInfo.discarded) {
@@ -131,6 +139,9 @@ chrome.runtime.onMessage.addListener((msg) => {
     send(response);
   } else if (msg.type === 'state_change') {
     send(msg);
+  } else if (msg.type === 'log') {
+    // Diagnostic line from a content script → forward to the daemon log.
+    send({ type: 'log', msg: msg.msg });
   } else if (msg.type === 'content_ready') {
     wake('content-ready');
   }

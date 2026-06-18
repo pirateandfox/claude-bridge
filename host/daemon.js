@@ -95,6 +95,13 @@ function flushAllRequests(err) {
 }
 
 function handleChromeMessage(msg) {
+  // Diagnostic line relayed from the extension (content script / background) so
+  // fleet debugging needs only this one log file, not the headless browser console.
+  if (msg.type === 'log') {
+    log(`[ext] ${msg.msg}`);
+    return;
+  }
+
   // Proactive state-change notification from content script
   if (msg.type === 'state_change') {
     log(`state_change: ${msg.sessionId} → ${msg.state}`);
@@ -252,6 +259,13 @@ function createMcpServer() {
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const { name, arguments: args = {} } = req.params;
 
+    // Log every tool call with a prompt-truncated arg summary, so the daemon log
+    // shows exactly which call ran and with what — paired with the dispatch /
+    // response / TIMEOUT lines, every outcome is explainable from this one file.
+    const argSummary = { ...args };
+    if (typeof argSummary.prompt === 'string') argSummary.prompt = `<${argSummary.prompt.length} chars>`;
+    log(`MCP call: ${name} ${JSON.stringify(argSummary)}`);
+
     try {
       let result;
 
@@ -305,9 +319,14 @@ function createMcpServer() {
           throw new Error(`Unknown tool: ${name}`);
       }
 
+      const summary = Array.isArray(result) ? `${result.length} item(s)`
+        : (result && typeof result === 'object') ? JSON.stringify(result).slice(0, 200)
+        : String(result);
+      log(`MCP ok: ${name} → ${summary}`);
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
 
     } catch (err) {
+      log(`MCP error: ${name}: ${err.message}`);
       return {
         content: [{ type: 'text', text: `Error: ${err.message}` }],
         isError: true,
