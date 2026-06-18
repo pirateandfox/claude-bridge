@@ -167,6 +167,40 @@ function sessionIdFromUrl() {
   return m ? m[1] : null;
 }
 
+// Read the branch bar ONLY when we can prove it belongs to `sessionId`.
+//
+// The bridge drives one shared claude.ai tab, and `.epitaxy-branch-row` is a
+// single document-global element in the detail panel. During a route transition
+// the OUTGOING session's bar lingers for a few frames (and React may even reuse
+// the same DOM node, just patching its text) — so reading the first match blind
+// returned a neighbour's branch/PR/diff. This gate is what keys the result to
+// the requested session instead of "whatever happens to be on screen".
+//
+//   navigated   — did we just switch sessions to get here? (false = we were
+//                 already parked on this session, so the visible bar is its own)
+//   prevBranch  — the featureBranch the bar showed for the session we left
+//                 (null if unknown), used to detect that content has switched.
+//
+// Returns the bar object when fresh, or null while it's still stale/unrendered.
+function readBranchBarFresh(sessionId, prevBranch, navigated) {
+  // Sidebar focus must be on this session at minimum.
+  if (activeSessionId() !== sessionId) return null;
+
+  const bb = readBranchBar();
+  if (!bb || !bb.featureBranch) return null;
+
+  // We never left this session — entry already confirmed URL + focus, so the
+  // currently-mounted bar is unambiguously this session's.
+  if (!navigated) return bb;
+
+  // We navigated here. Accept only once the router has committed to this session
+  // (authoritative), OR the bar's content has demonstrably switched away from
+  // the session we came from (covers node reuse and a flaky/absent URL signal).
+  if (sessionIdFromUrl() === sessionId) return bb;
+  if (prevBranch != null && bb.featureBranch !== prevBranch) return bb;
+  return null;
+}
+
 function findSendButton() {
   // Primary: known aria-label from DOM research
   const known = document.querySelector(SEL.sendBtn);
@@ -192,12 +226,21 @@ async function navigateToSession(sessionId) {
 
   row.querySelector(SEL.rowMainBtn)?.click();
 
-  // 1. Wait for the focused row to actually switch to this session.
+  // 1. Wait for the focused row to switch (fast, local sidebar update).
   await pollUntil(() => activeSessionId() === sessionId, 4000);
 
-  // 2. Wait for the branch bar or chat input to render. (Bounded by wall-clock
-  //    so a throttled background tab can't stretch this past the daemon
-  //    timeout — see pollUntil.)
+  // 2. Wait for the ROUTER to commit to this session. The URL (/code/session_X)
+  //    is the only authoritative signal that the *detail panel* — and therefore
+  //    the branch bar / model selector we scrape — now reflects THIS session and
+  //    not the one we navigated away from. Sidebar focus can flip a frame before
+  //    the route does, so reading on focus alone returned the previous session's
+  //    data. (pollUntil returns false rather than throwing if the URL never
+  //    commits, so downstream freshness checks can fall back to content change.)
+  await pollUntil(() => sessionIdFromUrl() === sessionId, 6000);
+
+  // 3. Wait for the detail panel to actually render (branch bar or chat input).
+  //    Bounded by wall-clock so a throttled background tab can't stretch this
+  //    past the daemon timeout — see pollUntil.
   await pollUntil(
     () => document.querySelector(SEL.branchBar) || document.querySelector(SEL.chatInput),
     6000,
@@ -532,31 +575,60 @@ chrome.runtime.onMessage.addListener((msg) => {
           const row = document.querySelector(`[data-row-key="code:${msg.sessionId}"]`);
           if (!row) { respond(requestId, { ok: false, error: 'Session not found' }); break; }
 
-          const { branchBar } = await withNavLock(async () => {
-            if (activeSessionId() !== msg.sessionId) {
-              await navigateToSession(msg.sessionId);
-            }
-            // Branch bar container may appear before its children render;
-            // briefly wait for featureBranch to populate. Wall-clock bounded so
-            // a throttled background tab can't stretch this to ~50s (the old
-            // 50-iteration loop did exactly that and blew the daemon timeout).
-            let bb = readBranchBar();
-            if (bb && !bb.featureBranch) {
-              await pollUntil(() => (bb = readBranchBar()) && bb.featureBranch, 800);
-            }
-            return { branchBar: bb };
+          // EVERYTHING that scrapes session-scoped UI (branch bar, model, effort,
+          // usage) must run inside the nav lock and while the tab is confirmed
+          // parked on this session. We drive ONE shared claude.ai tab, so a
+          // concurrent get_state/inject for another session could navigate the
+          // tab away mid-read — which is exactly how branchBar / model / effort /
+          // usage previously came back keyed to whatever was last visible rather
+          // than to msg.sessionId.
+          const scraped = await withNavLock(async () => {
+            const onSession = activeSessionId() === msg.sessionId
+                           && sessionIdFromUrl() === msg.sessionId;
+
+            // If we must switch, remember what the bar showed for the OUTGOING
+            // session so readBranchBarFresh can tell a stale (not-yet-updated)
+            // bar from the real one once the route flips.
+            const prevBranch = onSession ? null : (readBranchBar()?.featureBranch ?? null);
+            const navigated  = !onSession;
+
+            if (navigated) await navigateToSession(msg.sessionId);
+
+            // Block until either: (a) a branch bar PROVABLY belonging to this
+            // session has rendered, or (b) we can confirm this session simply has
+            // no branch yet (router committed, chat panel up, no bar element at
+            // all). Anything else stays pending — we'd rather return null than a
+            // neighbour's data. Wall-clock bounded; MutationObserver-driven so a
+            // throttled background tab doesn't stretch it (see pollUntil).
+            let branchBar = null;
+            await pollUntil(() => {
+              branchBar = readBranchBarFresh(msg.sessionId, prevBranch, navigated);
+              if (branchBar) return true;
+              const routeConfirmed = sessionIdFromUrl() === msg.sessionId;
+              const noBranchYet = routeConfirmed
+                && document.querySelector(SEL.chatInput)
+                && !document.querySelector(SEL.branchBar);
+              return !!noBranchYet; // resolve with branchBar === null
+            }, 4000);
+
+            // model/effort/usage are also document-global and session-scoped, so
+            // read them HERE — inside the lock, tab still parked on this session —
+            // not after the lock releases (the old code read them outside the lock,
+            // leaving a window for a concurrent navigation to swap the tab first).
+            const { model, effort, usagePct } = readModelEffortUsage();
+            return { branchBar, model, effort, usagePct };
           });
 
-          const state = readRowState(row);
-
-          // prUrl now comes straight off the PR link in readBranchBar — no need
-          // for the old /v1/sessions fetch (which had no timeout and could itself
-          // hang the call under the same background-tab conditions).
+          // prUrl comes straight off the PR link in readBranchBar — no /v1/sessions
+          // fetch needed (that had no timeout and could itself hang under the same
+          // background-tab conditions).
           respond(requestId, {
             ok: true,
-            state,
-            branchBar,
-            ...readModelEffortUsage(),
+            state: readRowState(row),
+            branchBar: scraped.branchBar,
+            model:     scraped.model,
+            effort:    scraped.effort,
+            usagePct:  scraped.usagePct,
           });
           break;
         }
