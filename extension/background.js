@@ -58,6 +58,7 @@ async function onDaemonMessage(msg) {
 
   const tabs = await chrome.tabs.query({ url: 'https://claude.ai/*' });
   if (!tabs.length) {
+    console.warn(`[claude-bridge] ${cmd}: no claude.ai tab open (requestId=${requestId})`);
     send({ requestId, ok: false, error: 'No claude.ai tab is open' });
     return;
   }
@@ -65,6 +66,9 @@ async function onDaemonMessage(msg) {
   // Prefer tabs on the Code sessions page, then active tab, then first
   const codeTab = tabs.find(t => t.url?.includes('/code'));
   const tab = codeTab ?? tabs.find(t => t.active) ?? tabs[0];
+  // Logs which tab a command was routed to — a login/interstitial URL here
+  // explains a hung command (the in-page API fetch never authenticates).
+  console.log(`[claude-bridge] ${cmd} → tab ${tab.id} ${tab.url} (requestId=${requestId})`);
 
   try {
     // Pass requestId so content script responds via chrome.runtime.sendMessage
@@ -75,6 +79,7 @@ async function onDaemonMessage(msg) {
     await chrome.tabs.sendMessage(tab.id, { requestId, cmd, sessionId, ...params });
   } catch (err) {
     if (err.message?.toLowerCase().includes('receiving end does not exist')) {
+      console.warn(`[claude-bridge] ${cmd}: content script not reachable on tab ${tab.id}, re-injecting (requestId=${requestId})`);
       try {
         const tabInfo = await chrome.tabs.get(tab.id);
         if (tabInfo.discarded) {

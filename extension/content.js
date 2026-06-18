@@ -56,15 +56,35 @@ function readSessionsFromDom() {
   return sessions;
 }
 
+// fetch() with a hard timeout. claude.ai's in-page API fetches (/v1/sessions,
+// /v1/code/sessions/.../events) have NO built-in timeout, so when the tab sits on
+// an auth wall or the network stalls, the promise never settles — and the command
+// handler awaiting it never responds. That hangs the whole bridge call until the
+// daemon's coarse timeout fires, all while passive state_change events keep
+// flowing from the (separate) MutationObserver path, masking the stall. An
+// AbortController turns that silent hang into a fast, catchable error.
+async function fetchWithTimeout(url, opts = {}, timeoutMs = 8000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...opts, signal: ctrl.signal });
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error(`fetch timed out after ${timeoutMs}ms: ${url}`);
+    throw e;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 async function readSessions() {
   try {
-    const resp = await fetch('/v1/sessions?limit=100', {
+    const resp = await fetchWithTimeout('/v1/sessions?limit=100', {
       credentials: 'include',
       headers: {
         'anthropic-beta':    'managed-agents-2026-04-01',
         'anthropic-version': '2023-06-01',
       },
-    });
+    }, 8000);
     if (!resp.ok) throw new Error(`Sessions API ${resp.status}`);
     const data = await resp.json();
     console.log('[claude-bridge] sessions API sample:', JSON.stringify(data.data?.[0], null, 2));
@@ -425,13 +445,13 @@ async function readTranscript(sessionId, lastN) {
     const params = new URLSearchParams({ limit: 200 });
     if (cursor) params.set('cursor', cursor);
 
-    const resp = await fetch(`/v1/code/sessions/${cseId}/events?${params}`, {
+    const resp = await fetchWithTimeout(`/v1/code/sessions/${cseId}/events?${params}`, {
       credentials: 'include',
       headers: {
         'anthropic-beta':    'managed-agents-2026-04-01',
         'anthropic-version': '2023-06-01',
       },
-    });
+    }, 10000);
     if (!resp.ok) throw new Error(`Events API ${resp.status}`);
     const data = await resp.json();
 

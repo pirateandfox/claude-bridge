@@ -61,10 +61,12 @@ function dispatchTask(task) {
   };
 
   const timer = setTimeout(() => {
+    log(`TIMEOUT ${task.cmd} after ${ms}ms — no Chrome response (requestId=${requestId})`);
     finish(task.reject)(new Error(`Timed out waiting for Chrome response (${task.cmd})`));
   }, ms);
 
   pending.set(requestId, { resolve: finish(task.resolve), reject: finish(task.reject), timer });
+  log(`→ dispatch ${task.cmd} (requestId=${requestId}, timeout=${ms}ms)`);
   chromeSocket.write(JSON.stringify({ requestId, cmd: task.cmd, ...task.params }) + '\n');
 }
 
@@ -100,8 +102,16 @@ function handleChromeMessage(msg) {
   }
 
   const entry = msg.requestId && pending.get(msg.requestId);
-  if (!entry) return;
+  if (!entry) {
+    // A response (or error) arrived that we have no pending entry for — it was
+    // already settled/timed out, or the requestId got mangled in relay. Logging
+    // it distinguishes "content never replied" (no orphan, just TIMEOUT) from
+    // "content replied too late / uncorrelated" (orphan after TIMEOUT).
+    if (msg.requestId) log(`orphan response (requestId=${msg.requestId}, ok=${msg.ok}) — already settled or uncorrelated`);
+    return;
+  }
 
+  log(`← response ${msg.ok ? 'ok' : `error: ${msg.error}`} (requestId=${msg.requestId})`);
   if (msg.ok) entry.resolve(msg);
   else        entry.reject(new Error(msg.error ?? 'Chrome returned an error'));
 }
