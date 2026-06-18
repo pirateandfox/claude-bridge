@@ -585,38 +585,56 @@ chrome.runtime.onMessage.addListener((msg) => {
           const scraped = await withNavLock(async () => {
             const onSession = activeSessionId() === msg.sessionId
                            && sessionIdFromUrl() === msg.sessionId;
+            const navigated = !onSession;
 
-            // If we must switch, remember what the bar showed for the OUTGOING
-            // session so readBranchBarFresh can tell a stale (not-yet-updated)
-            // bar from the real one once the route flips.
-            const prevBranch = onSession ? null : (readBranchBar()?.featureBranch ?? null);
-            const navigated  = !onSession;
+            // Snapshot the OUTGOING session's branch + usage BEFORE we navigate,
+            // so the freshness checks below can tell THIS session's real values
+            // from a stale render lingering through the route transition.
+            const prevBranch = navigated ? (readBranchBar()?.featureBranch ?? null) : null;
+            const prevUsage  = navigated ? readModelEffortUsage().usagePct : null;
 
             if (navigated) await navigateToSession(msg.sessionId);
 
-            // Block until either: (a) a branch bar PROVABLY belonging to this
-            // session has rendered, or (b) we can confirm this session simply has
-            // no branch yet (router committed, chat panel up, no bar element at
-            // all). Anything else stays pending — we'd rather return null than a
-            // neighbour's data. Wall-clock bounded; MutationObserver-driven so a
-            // throttled background tab doesn't stretch it (see pollUntil).
+            // Block until the detail panel is PROVABLY this session's AND its
+            // session-scoped controls have rendered. Everything we scrape
+            // (.epitaxy-branch-row plus the model/effort/usage buttons) is
+            // document-global, so without this gate we'd return whatever the tab
+            // last showed — which is how branchBar AND usagePct previously came
+            // back keyed to the wrong session. Wall-clock bounded;
+            // MutationObserver-driven so a throttled background tab can't stretch
+            // it (see pollUntil).
             let branchBar = null;
+            let mev = { model: null, effort: null, usagePct: null };
             await pollUntil(() => {
-              branchBar = readBranchBarFresh(msg.sessionId, prevBranch, navigated);
-              if (branchBar) return true;
               const routeConfirmed = sessionIdFromUrl() === msg.sessionId;
-              const noBranchYet = routeConfirmed
-                && document.querySelector(SEL.chatInput)
-                && !document.querySelector(SEL.branchBar);
-              return !!noBranchYet; // resolve with branchBar === null
+
+              // Branch bar: fresh (proven this session's), or confirmed no-branch
+              // (route committed, composer up, no bar element at all).
+              branchBar = readBranchBarFresh(msg.sessionId, prevBranch, navigated);
+              const branchReady = branchBar
+                || (routeConfirmed
+                    && document.querySelector(SEL.chatInput)
+                    && !document.querySelector(SEL.branchBar));
+              if (!branchReady) return false;
+
+              // model/effort/usage live in the same route-keyed panel, but usagePct
+              // has no unique per-session token to verify against (two sessions can
+              // legitimately read 12%). So: require the route committed (panel is
+              // this session's), then accept once the meter is unambiguously this
+              // session's — we didn't navigate, or there's no prior value to
+              // confuse it with, or the meter moved off the previous session's
+              // number, or this session simply has no meter. Otherwise keep waiting
+              // (the meter may still be showing the outgoing session's value).
+              if (navigated && !routeConfirmed) return false;
+              mev = readModelEffortUsage();
+              const usageReady = !navigated
+                || prevUsage == null
+                || mev.usagePct == null
+                || mev.usagePct !== prevUsage;
+              return usageReady;
             }, 4000);
 
-            // model/effort/usage are also document-global and session-scoped, so
-            // read them HERE — inside the lock, tab still parked on this session —
-            // not after the lock releases (the old code read them outside the lock,
-            // leaving a window for a concurrent navigation to swap the tab first).
-            const { model, effort, usagePct } = readModelEffortUsage();
-            return { branchBar, model, effort, usagePct };
+            return { branchBar, model: mev.model, effort: mev.effort, usagePct: mev.usagePct };
           });
 
           // prUrl comes straight off the PR link in readBranchBar — no /v1/sessions
