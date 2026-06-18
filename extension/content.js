@@ -85,6 +85,10 @@ async function readSessions() {
         'anthropic-version': '2023-06-01',
       },
     }, 8000);
+    // 401/403 means the bridge's Chrome isn't signed in to claude.ai. The DOM
+    // fallback is useless here (a logged-out page has no session rows either), so
+    // surface an actionable error instead of a silent empty list / hang.
+    if (resp.status === 401 || resp.status === 403) throw new Error('NOT_AUTHENTICATED');
     if (!resp.ok) throw new Error(`Sessions API ${resp.status}`);
     const data = await resp.json();
     console.log('[claude-bridge] sessions API sample:', JSON.stringify(data.data?.[0], null, 2));
@@ -97,6 +101,12 @@ async function readSessions() {
     // If API returns results, use them; otherwise fall through to DOM
     if (apiSessions.length > 0) return apiSessions;
   } catch (e) {
+    // Auth failure is a real, user-fixable condition — propagate it verbatim so
+    // the agent sees "log in", not an empty list. Everything else (timeout,
+    // transient network) falls back to scraping the sidebar DOM.
+    if (e.message === 'NOT_AUTHENTICATED') {
+      throw new Error('Not signed in to claude.ai in the bridge browser. Open https://claude.ai/code in that Chrome profile, log in, then retry.');
+    }
     console.log('[claude-bridge] sessions API failed, using DOM fallback:', e.message);
   }
   return readSessionsFromDom();
