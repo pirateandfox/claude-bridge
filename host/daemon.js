@@ -164,7 +164,7 @@ const TOOLS = [
   },
   {
     name: 'claude_session_get_state',
-    description: 'Get detailed state for a specific session: running/ready/merged/pr_open, branch info, CI status, model, usage.',
+    description: 'Get detailed state for a specific session: running/ready/merged/pr_open, branch info, CI status, model, effort. Also returns usagePct — the ACCOUNT plan usage % ("Usage: plan N%"), which is global, NOT per-session (same value for every session).',
     inputSchema: {
       type: 'object',
       properties: {

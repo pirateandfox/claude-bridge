@@ -631,53 +631,38 @@ chrome.runtime.onMessage.addListener((msg) => {
                            && sessionIdFromUrl() === msg.sessionId;
             const navigated = !onSession;
 
-            // Snapshot the OUTGOING session's branch + usage BEFORE we navigate,
-            // so the freshness checks below can tell THIS session's real values
-            // from a stale render lingering through the route transition.
+            // Snapshot the OUTGOING session's branch BEFORE we navigate, so the
+            // freshness check can tell THIS session's branch bar from a stale one
+            // lingering through the route transition.
             const prevBranch = navigated ? (readBranchBar()?.featureBranch ?? null) : null;
-            const prevUsage  = navigated ? readModelEffortUsage().usagePct : null;
 
             if (navigated) await navigateToSession(msg.sessionId);
 
-            // Block until the detail panel is PROVABLY this session's AND its
-            // session-scoped controls have rendered. Everything we scrape
-            // (.epitaxy-branch-row plus the model/effort/usage buttons) is
-            // document-global, so without this gate we'd return whatever the tab
-            // last showed — which is how branchBar AND usagePct previously came
-            // back keyed to the wrong session. Wall-clock bounded;
-            // MutationObserver-driven so a throttled background tab can't stretch
-            // it (see pollUntil).
+            // Block until the detail panel is PROVABLY this session's: a branch
+            // bar that's fresh (readBranchBarFresh) or a confirmed no-branch state
+            // (route committed, composer up, no bar element). .epitaxy-branch-row
+            // is document-global, so without this gate we'd return whatever the tab
+            // last showed — that's how branchBar previously came back keyed to the
+            // wrong session. Wall-clock bounded; MutationObserver-driven so a
+            // throttled background tab can't stretch it (see pollUntil).
             let branchBar = null;
-            let mev = { model: null, effort: null, usagePct: null };
             await pollUntil(() => {
               const routeConfirmed = sessionIdFromUrl() === msg.sessionId;
-
-              // Branch bar: fresh (proven this session's), or confirmed no-branch
-              // (route committed, composer up, no bar element at all).
               branchBar = readBranchBarFresh(msg.sessionId, prevBranch, navigated);
-              const branchReady = branchBar
+              return branchBar
                 || (routeConfirmed
                     && document.querySelector(SEL.chatInput)
                     && !document.querySelector(SEL.branchBar));
-              if (!branchReady) return false;
-
-              // model/effort/usage live in the same route-keyed panel, but usagePct
-              // has no unique per-session token to verify against (two sessions can
-              // legitimately read 12%). So: require the route committed (panel is
-              // this session's), then accept once the meter is unambiguously this
-              // session's — we didn't navigate, or there's no prior value to
-              // confuse it with, or the meter moved off the previous session's
-              // number, or this session simply has no meter. Otherwise keep waiting
-              // (the meter may still be showing the outgoing session's value).
-              if (navigated && !routeConfirmed) return false;
-              mev = readModelEffortUsage();
-              const usageReady = !navigated
-                || prevUsage == null
-                || mev.usagePct == null
-                || mev.usagePct !== prevUsage;
-              return usageReady;
             }, 4000);
 
+            // Now read model/effort/usage — inside the lock, panel confirmed on
+            // this session. model/effort are per-session (the composer's selector)
+            // and rendered with the panel we just gated on. usagePct is NOT
+            // per-session: it's the global account meter ("Usage: plan N%") in the
+            // app chrome, identical for every session — so it needs no per-session
+            // gating (an earlier attempt to "wait until it changes" wrongly forced
+            // a timeout, since a global value never changes between sessions).
+            const mev = readModelEffortUsage();
             return { branchBar, model: mev.model, effort: mev.effort, usagePct: mev.usagePct };
           });
 
