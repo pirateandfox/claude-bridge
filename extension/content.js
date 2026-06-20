@@ -86,13 +86,26 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = 8000) {
 
 async function readSessions() {
   try {
-    const resp = await fetchWithTimeout('/v1/sessions?limit=100', {
-      credentials: 'include',
-      headers: {
-        'anthropic-beta':    'managed-agents-2026-04-01',
-        'anthropic-version': '2023-06-01',
-      },
-    }, 8000);
+    // On a cold/remote box the very first fetch often times out before the SPA
+    // has fully booted. Retry the timeout/network case a couple times with a
+    // short backoff so a single cold miss doesn't fall straight to the DOM.
+    let resp;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        resp = await fetchWithTimeout('/v1/sessions?limit=100', {
+          credentials: 'include',
+          headers: {
+            'anthropic-beta':    'managed-agents-2026-04-01',
+            'anthropic-version': '2023-06-01',
+          },
+        }, 8000);
+        break;
+      } catch (e) {
+        if (attempt >= 3) throw e;
+        relayLog(`sessions API attempt ${attempt} failed (${e.message}); retrying`);
+        await sleep(750 * attempt);
+      }
+    }
     // 401/403 means the bridge's Chrome isn't signed in to claude.ai. The DOM
     // fallback is useless here (a logged-out page has no session rows either), so
     // surface an actionable error instead of a silent empty list / hang.
@@ -105,11 +118,20 @@ async function readSessions() {
       state:     s.session_status ?? 'ready',
       repo:      s.session_context?.outcomes?.[0]?.git_info?.repo ?? null,
     }));
-    // Trust the API result even when it's empty: an authenticated account with
-    // zero sessions is a real, valid state. (Previously an empty result fell
-    // through to the DOM scrape, conflating "0 sessions" with "API failed" and
-    // making a blank list ambiguous.) The DOM fallback is only for an actual API
-    // failure (timeout / network / non-OK status).
+    // An empty API result is ambiguous on a cold/booting page: /v1/sessions can
+    // return {data: []} transiently while the SPA's workspace context is still
+    // being established (cookies present, sessions not yet indexed). Only trust
+    // empty when the DOM agrees — if the sidebar already shows rows, the API
+    // answered prematurely, so prefer the DOM rather than reporting a false [].
+    // (This keeps commit a553206's intent — a genuinely empty account returns []
+    // — while eliminating the false-empty that forced a manual warm on remote.)
+    if (apiSessions.length === 0) {
+      const domSessions = readSessionsFromDom();
+      if (domSessions.length > 0) {
+        relayLog(`sessions API empty but DOM has ${domSessions.length}; using DOM (page still booting?)`);
+        return domSessions;
+      }
+    }
     relayLog(`sessions API ok — ${apiSessions.length} session(s)`);
     return apiSessions;
   } catch (e) {
