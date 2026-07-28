@@ -244,11 +244,11 @@ function sessionIdFromUrl() {
 //
 //   navigated   — did we just switch sessions to get here? (false = we were
 //                 already parked on this session, so the visible bar is its own)
-//   prevBranch  — the featureBranch the bar showed for the session we left
-//                 (null if unknown), used to detect that content has switched.
+//   prevSig     — signature of the bar shown for the session we left (null if
+//                 unknown), used to detect that content has switched.
 //
 // Returns the bar object when fresh, or null while it's still stale/unrendered.
-function readBranchBarFresh(sessionId, prevBranch, navigated) {
+function readBranchBarFresh(sessionId, prevSig, navigated) {
   // Sidebar focus must be on this session at minimum.
   if (activeSessionId() !== sessionId) return null;
 
@@ -259,12 +259,24 @@ function readBranchBarFresh(sessionId, prevBranch, navigated) {
   // currently-mounted bar is unambiguously this session's.
   if (!navigated) return bb;
 
-  // We navigated here. Accept only once the router has committed to this session
-  // (authoritative), OR the bar's content has demonstrably switched away from
-  // the session we came from (covers node reuse and a flaky/absent URL signal).
-  if (sessionIdFromUrl() === sessionId) return bb;
-  if (prevBranch != null && bb.featureBranch !== prevBranch) return bb;
+  // We navigated here. The router commits the URL BEFORE React re-renders the
+  // detail panel, so a route match is NOT proof the visible bar belongs to this
+  // session — accepting on it returned the previously-viewed session's branch,
+  // PR and diff under the requested session's id. Require the bar to have
+  // demonstrably changed from the one we left.
+  //
+  // With no previous bar to compare against (we came from a session that had
+  // none), the route is the only signal available — fall back to it.
+  if (prevSig == null) return sessionIdFromUrl() === sessionId ? bb : null;
+  if (branchBarSig(bb) !== prevSig) return bb;
   return null;
+}
+
+// Identity signature for a branch bar. Compares more than featureBranch so two
+// sessions on similarly-named (or UI-truncated) branches still read as distinct.
+function branchBarSig(bb) {
+  if (!bb) return null;
+  return [bb.featureBranch, bb.baseBranch, bb.prNumber, bb.additions, bb.deletions].join('|');
 }
 
 function findSendButton() {
@@ -653,10 +665,10 @@ chrome.runtime.onMessage.addListener((msg) => {
                            && sessionIdFromUrl() === msg.sessionId;
             const navigated = !onSession;
 
-            // Snapshot the OUTGOING session's branch BEFORE we navigate, so the
+            // Snapshot the OUTGOING session's bar BEFORE we navigate, so the
             // freshness check can tell THIS session's branch bar from a stale one
             // lingering through the route transition.
-            const prevBranch = navigated ? (readBranchBar()?.featureBranch ?? null) : null;
+            const prevSig = navigated ? branchBarSig(readBranchBar()) : null;
 
             if (navigated) await navigateToSession(msg.sessionId);
 
@@ -670,7 +682,7 @@ chrome.runtime.onMessage.addListener((msg) => {
             let branchBar = null;
             await pollUntil(() => {
               const routeConfirmed = sessionIdFromUrl() === msg.sessionId;
-              branchBar = readBranchBarFresh(msg.sessionId, prevBranch, navigated);
+              branchBar = readBranchBarFresh(msg.sessionId, prevSig, navigated);
               return branchBar
                 || (routeConfirmed
                     && document.querySelector(SEL.chatInput)
