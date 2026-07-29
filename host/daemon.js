@@ -175,7 +175,7 @@ const TOOLS = [
   },
   {
     name: 'claude_session_inject',
-    description: 'Send a prompt to a session. Navigates to the session if not already active, submits the prompt, and returns immediately. Poll get_state to know when it finishes.',
+    description: 'Send a prompt to a session. Navigates to the session if not already active, submits the prompt, and returns immediately. Poll get_state to know when it finishes. Aborts rather than injecting if the shared tab cannot be confirmed parked on session_id. Returns { injected, sessionId, verified, turnId }: verified:true means the prompt was observed as a new user turn in THAT session (turnId is checkable via get_transcript). verified:false means acceptance could not be proven — check the transcript before retrying, since a retry of an inject that did land will double-post.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -286,8 +286,16 @@ function createMcpServer() {
           break;
         }
         case 'claude_session_inject': {
-          await sendToChrome('inject', { sessionId: args.session_id, prompt: args.prompt });
-          result = { injected: true };
+          const r = await sendToChrome('inject', { sessionId: args.session_id, prompt: args.prompt });
+          // Echo back the session we were asked for plus proof of landing, so a
+          // caller can tell "accepted" from "delivered". `injected: true` alone
+          // could not distinguish those — see the 2026-07-29 misroute.
+          result = {
+            injected:  true,
+            sessionId: args.session_id,
+            verified:  r?.verified ?? false,
+            turnId:    r?.turnId ?? null,
+          };
           break;
         }
         case 'claude_session_create': {
