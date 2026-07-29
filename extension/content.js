@@ -616,7 +616,15 @@ async function confirmInjected(sessionId, prompt, before) {
                 || head.timestamp !== before.timestamp;
 
     if (isNew && (!wanted || normText(head.text).includes(wanted))) {
-      return { verified: true, turnId: head.id, turnTimestamp: head.timestamp };
+      // The events API does not expose a stable per-event id today, so fall back
+      // to the turn's timestamp — which IS checkable, because get_transcript
+      // returns `timestamp` on every turn. Keep the id preference first in case
+      // the API grows one.
+      return {
+        verified: true,
+        turnId: head.id ?? head.timestamp ?? null,
+        turnTimestamp: head.timestamp,
+      };
     }
   }
 
