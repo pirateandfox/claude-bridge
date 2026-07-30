@@ -175,7 +175,7 @@ const TOOLS = [
   },
   {
     name: 'claude_session_inject',
-    description: 'Send a prompt to a session. Navigates to the session if not already active, submits the prompt, and returns immediately. Poll get_state to know when it finishes. Aborts rather than injecting if the shared tab cannot be confirmed parked on session_id. Returns { injected, sessionId, verified, turnId }: verified:true means the prompt was observed as a new user turn in THAT session (turnId is checkable via get_transcript). verified:false means acceptance could not be proven — check the transcript before retrying, since a retry of an inject that did land will double-post.',
+    description: 'Send a prompt to a session. Navigates to the session if not already active, submits the prompt, then spends up to ~15s confirming delivery before returning — it does NOT return the instant the prompt is submitted, though it still returns long before the agent finishes working. Poll get_state to know when the run itself finishes. Aborts rather than injecting if the shared tab cannot be confirmed parked on session_id. Returns { injected, sessionId, verified, turnId }: verified:true means the prompt was observed as a new user turn in THAT session (turnId is checkable via get_transcript). verified:false means delivery could not be proven within the confirmation budget — read the transcript before retrying, since a retry of an inject that did land will double-post.',
     inputSchema: {
       type: 'object',
       properties: {

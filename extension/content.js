@@ -570,7 +570,7 @@ async function readTranscript(sessionId, lastN) {
 // observe "whatever the shared claude.ai tab happens to be showing". The
 // sessionId is in the URL path, so the answer is keyed to the session by
 // construction.
-async function sessionEventHead(sessionId) {
+async function sessionEventHead(sessionId, timeoutMs = 5000) {
   const cseId = sessionId.replace(/^session_/, 'cse_');
   const resp = await fetchWithTimeout(`/v1/code/sessions/${cseId}/events?limit=20`, {
     credentials: 'include',
@@ -578,7 +578,7 @@ async function sessionEventHead(sessionId) {
       'anthropic-beta':    'managed-agents-2026-04-01',
       'anthropic-version': '2023-06-01',
     },
-  }, 8000);
+  }, timeoutMs);
   if (!resp.ok) throw new Error(`Events API ${resp.status}`);
   const data = await resp.json();
 
@@ -593,27 +593,49 @@ async function sessionEventHead(sessionId) {
 
 const normText = (s) => (s ?? '').replace(/\s+/g, ' ').trim();
 
-// Confirm the prompt actually became a new user turn in THIS session, and hand
+// Hard wall-clock budget for delivery confirmation.
+//
+// This MUST leave room under the daemon's 60s `inject` timeout, because a daemon
+// timeout is the one outcome worse than "unverified": it surfaces as an error for
+// a prompt that actually landed, which invites the retry that double-posts. Worst
+// case for the whole inject path is navigateToSession (~16s) + injectPrompt (~1s)
+// + baseline head (5s) + this budget — comfortably inside 60s.
+//
+// Bounded by Date.now(), not by attempt count, because these are raw `sleep()`
+// calls and Chrome throttles timers hard in background tabs — which is where the
+// bridge's tab always is (see pollUntil's note). An attempt-counted loop looks
+// like 6s on paper and can take far longer in a hidden tab.
+const CONFIRM_BUDGET_MS = 15_000;
+
+// Confirm the prompt actually became a NEW user turn in THIS session, and hand
 // back a turn id the caller can re-verify against get_transcript.
 //
-// Reports rather than throws on timeout: a false negative that surfaced as an
-// error would invite a blind retry, and a retry of an inject that DID land
-// double-posts the prompt. So an unconfirmed result returns verified:false and
-// lets the caller check the transcript instead of guessing.
+// Reports rather than throws: an unconfirmed result returns verified:false and
+// lets the caller check the transcript, instead of raising an error that invites
+// a blind — and possibly duplicating — retry.
 async function confirmInjected(sessionId, prompt, before) {
-  const wanted = normText(prompt).slice(0, 80);
+  // No baseline means we cannot distinguish a new turn from one already present.
+  // That matters most on a RETRY of a prompt that already landed: the newest turn
+  // is then our own text from the previous attempt, so a failed injection would
+  // read as verified. Report unverifiable rather than guessing.
+  if (!before) {
+    return { verified: false, turnId: null, turnTimestamp: null, reason: 'no-baseline' };
+  }
 
-  for (let attempt = 0; attempt < 6; attempt++) {
-    await sleep(1000);
+  const wanted   = normText(prompt).slice(0, 80);
+  const deadline = Date.now() + CONFIRM_BUDGET_MS;
+
+  while (Date.now() < deadline) {
+    await sleep(750);
+    if (Date.now() >= deadline) break;
 
     let head;
-    try { head = await sessionEventHead(sessionId); }
+    try { head = await sessionEventHead(sessionId, 4000); }
     catch { continue; }               // transient API blip — keep waiting
     if (!head) continue;
 
-    const isNew = !before
-                || (head.id && before.id && head.id !== before.id)
-                || head.timestamp !== before.timestamp;
+    const isNew = (head.id && before.id && head.id !== before.id)
+               || head.timestamp !== before.timestamp;
 
     if (isNew && (!wanted || normText(head.text).includes(wanted))) {
       // The events API does not expose a stable per-event id today, so fall back
@@ -628,7 +650,12 @@ async function confirmInjected(sessionId, prompt, before) {
     }
   }
 
-  return { verified: false, turnId: null, turnTimestamp: null };
+  return {
+    verified: false,
+    turnId: null,
+    turnTimestamp: null,
+    reason: 'unconfirmed-within-budget',
+  };
 }
 
 function parseEvent(ev) {
@@ -848,9 +875,10 @@ chrome.runtime.onMessage.addListener((msg) => {
 
             // Baseline for proof-of-delivery, from the session-keyed events API
             // rather than the DOM (see sessionEventHead). Best-effort: if the API
-            // is unavailable we still inject, we just can't prove the landing.
+            // is unavailable we still inject, we just report verified:false —
+            // confirmInjected refuses to guess without a baseline.
             let before = null;
-            try { before = await sessionEventHead(msg.sessionId); } catch {}
+            try { before = await sessionEventHead(msg.sessionId, 5000); } catch {}
 
             await injectPrompt(msg.prompt, { sessionId: msg.sessionId });
 
@@ -865,7 +893,8 @@ chrome.runtime.onMessage.addListener((msg) => {
 
           relayLog(
             `inject ${msg.sessionId}: verified=${delivery.verified} ` +
-            `turnId=${delivery.turnId ?? 'none'} stillParked=${delivery.stillParked}`
+            `turnId=${delivery.turnId ?? 'none'} stillParked=${delivery.stillParked}` +
+            (delivery.reason ? ` reason=${delivery.reason}` : '')
           );
           respond(requestId, { ok: true, ...delivery });
           break;
