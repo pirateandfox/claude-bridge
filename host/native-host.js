@@ -20,6 +20,22 @@ socket.on('error', (err) => {
   process.exit(1);
 });
 
+// A daemon restart closes this socket CLEANLY — no 'error' event. Without this
+// handler the relay stayed alive with socketReady=true, writing frames into a
+// dead socket forever; Chrome's port to us was still open, so background.js
+// never saw a disconnect and never reconnected, and the whole bridge reported
+// "Chrome not connected" until the relay was killed by hand. Reloading the
+// extension did NOT clear it, because the stale relay survives the reload.
+//
+// Exiting instead drops Chrome's port, which fires background.js's onDisconnect
+// and its 2s scheduleReconnect — spawning a fresh relay against the new daemon.
+// Observed 2026-07-29 while deploying the inject fix: every box that restarts
+// its daemon wedges exactly this way.
+socket.on('close', () => {
+  process.stderr.write('[native-host] daemon socket closed — exiting so Chrome reconnects\n');
+  process.exit(1);
+});
+
 // Daemon -> Chrome: read newline-delimited JSON from socket, write native messaging frames
 let buf = '';
 socket.on('data', (chunk) => {

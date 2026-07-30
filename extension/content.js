@@ -298,6 +298,15 @@ function findSendButton() {
   return null;
 }
 
+// Returns a commit report — { focused, routed, rendered } — rather than throwing
+// when a wait times out.
+//
+// This is deliberate and load-bearing: `get_state` calls this and then runs its
+// OWN freshness gate (readBranchBarFresh, or a confirmed no-branch state), so it
+// needs a timed-out navigation to fall through rather than blow up. Callers that
+// must NOT act on a half-committed navigation (inject) are responsible for
+// checking identity themselves before touching session-scoped UI — see the
+// `inject` case. Do not "fix" this by throwing here without auditing get_state.
 async function navigateToSession(sessionId) {
   const row = document.querySelector(`[data-row-key="code:${sessionId}"]`);
   if (!row) throw new Error(`Session not found: ${sessionId}`);
@@ -305,7 +314,7 @@ async function navigateToSession(sessionId) {
   row.querySelector(SEL.rowMainBtn)?.click();
 
   // 1. Wait for the focused row to switch (fast, local sidebar update).
-  await pollUntil(() => activeSessionId() === sessionId, 4000);
+  const focused = await pollUntil(() => activeSessionId() === sessionId, 4000);
 
   // 2. Wait for the ROUTER to commit to this session. The URL (/code/session_X)
   //    is the only authoritative signal that the *detail panel* — and therefore
@@ -314,15 +323,22 @@ async function navigateToSession(sessionId) {
   //    the route does, so reading on focus alone returned the previous session's
   //    data. (pollUntil returns false rather than throwing if the URL never
   //    commits, so downstream freshness checks can fall back to content change.)
-  await pollUntil(() => sessionIdFromUrl() === sessionId, 6000);
+  const routed = await pollUntil(() => sessionIdFromUrl() === sessionId, 6000);
 
   // 3. Wait for the detail panel to actually render (branch bar or chat input).
   //    Bounded by wall-clock so a throttled background tab can't stretch this
   //    past the daemon timeout — see pollUntil.
-  await pollUntil(
+  //
+  //    NOTE: both selectors here are document-global, so this wait can be
+  //    satisfied by the OUTGOING session's panel. It is a liveness check ("the
+  //    app is rendering something"), NOT proof we arrived. Never treat it as
+  //    arrival proof — gate on `routed`/`focused` for that.
+  const rendered = await pollUntil(
     () => document.querySelector(SEL.branchBar) || document.querySelector(SEL.chatInput),
     6000,
   );
+
+  return { focused, routed, rendered };
 }
 
 // Click through every session row to force the UI to hydrate branch bars.
@@ -358,7 +374,29 @@ async function warmAllSessions() {
   return warmed;
 }
 
-async function injectPrompt(text) {
+// Refuse to act on session-scoped UI unless the shared tab is PROVABLY parked on
+// `sessionId` — both the sidebar focus and the committed route must agree.
+//
+// Why both: sidebar focus flips a frame before the router commits, so focus alone
+// says "we're heading there", not "we're there". The route is what determines
+// which session the composer posts to.
+function assertParkedOn(sessionId, what) {
+  const focus = activeSessionId();
+  const route = sessionIdFromUrl();
+  if (focus === sessionId && route === sessionId) return;
+
+  throw new Error(
+    `${what} aborted — shared tab is not on the target session ` +
+    `(wanted ${sessionId}, focus=${focus ?? 'none'}, route=${route ?? 'none'})`
+  );
+}
+
+// `sessionId` is optional: pass it whenever the prompt is meant for an EXISTING
+// session and this will refuse to type unless the tab is provably parked there.
+// createSession omits it — a session that doesn't exist yet has no id to check.
+async function injectPrompt(text, { sessionId } = {}) {
+  if (sessionId) assertParkedOn(sessionId, 'injectPrompt');
+
   const input = document.querySelector(SEL.chatInput);
   if (!input) throw new Error('Chat input not found');
 
@@ -526,6 +564,100 @@ async function readTranscript(sessionId, lastN) {
   return turns;
 }
 
+// Newest user turn for `sessionId`, read straight off the session-keyed events
+// API. DOM-INDEPENDENT ON PURPOSE: this is the channel used to PROVE that an
+// injected prompt landed in the session we asked for, so it must not be able to
+// observe "whatever the shared claude.ai tab happens to be showing". The
+// sessionId is in the URL path, so the answer is keyed to the session by
+// construction.
+async function sessionEventHead(sessionId, timeoutMs = 5000) {
+  const cseId = sessionId.replace(/^session_/, 'cse_');
+  const resp = await fetchWithTimeout(`/v1/code/sessions/${cseId}/events?limit=20`, {
+    credentials: 'include',
+    headers: {
+      'anthropic-beta':    'managed-agents-2026-04-01',
+      'anthropic-version': '2023-06-01',
+    },
+  }, timeoutMs);
+  if (!resp.ok) throw new Error(`Events API ${resp.status}`);
+  const data = await resp.json();
+
+  // Default page order is newest-first — first user event is the latest one.
+  for (const ev of (data.data ?? [])) {
+    if (ev.event_type !== 'user') continue;
+    const turn = parseEvent(ev);
+    if (turn) return { id: ev.id ?? null, text: turn.text, timestamp: turn.timestamp };
+  }
+  return null;
+}
+
+const normText = (s) => (s ?? '').replace(/\s+/g, ' ').trim();
+
+// Hard wall-clock budget for delivery confirmation.
+//
+// This MUST leave room under the daemon's 60s `inject` timeout, because a daemon
+// timeout is the one outcome worse than "unverified": it surfaces as an error for
+// a prompt that actually landed, which invites the retry that double-posts. Worst
+// case for the whole inject path is navigateToSession (~16s) + injectPrompt (~1s)
+// + baseline head (5s) + this budget — comfortably inside 60s.
+//
+// Bounded by Date.now(), not by attempt count, because these are raw `sleep()`
+// calls and Chrome throttles timers hard in background tabs — which is where the
+// bridge's tab always is (see pollUntil's note). An attempt-counted loop looks
+// like 6s on paper and can take far longer in a hidden tab.
+const CONFIRM_BUDGET_MS = 15_000;
+
+// Confirm the prompt actually became a NEW user turn in THIS session, and hand
+// back a turn id the caller can re-verify against get_transcript.
+//
+// Reports rather than throws: an unconfirmed result returns verified:false and
+// lets the caller check the transcript, instead of raising an error that invites
+// a blind — and possibly duplicating — retry.
+async function confirmInjected(sessionId, prompt, before) {
+  // No baseline means we cannot distinguish a new turn from one already present.
+  // That matters most on a RETRY of a prompt that already landed: the newest turn
+  // is then our own text from the previous attempt, so a failed injection would
+  // read as verified. Report unverifiable rather than guessing.
+  if (!before) {
+    return { verified: false, turnId: null, turnTimestamp: null, reason: 'no-baseline' };
+  }
+
+  const wanted   = normText(prompt).slice(0, 80);
+  const deadline = Date.now() + CONFIRM_BUDGET_MS;
+
+  while (Date.now() < deadline) {
+    await sleep(750);
+    if (Date.now() >= deadline) break;
+
+    let head;
+    try { head = await sessionEventHead(sessionId, 4000); }
+    catch { continue; }               // transient API blip — keep waiting
+    if (!head) continue;
+
+    const isNew = (head.id && before.id && head.id !== before.id)
+               || head.timestamp !== before.timestamp;
+
+    if (isNew && (!wanted || normText(head.text).includes(wanted))) {
+      // The events API does not expose a stable per-event id today, so fall back
+      // to the turn's timestamp — which IS checkable, because get_transcript
+      // returns `timestamp` on every turn. Keep the id preference first in case
+      // the API grows one.
+      return {
+        verified: true,
+        turnId: head.id ?? head.timestamp ?? null,
+        turnTimestamp: head.timestamp,
+      };
+    }
+  }
+
+  return {
+    verified: false,
+    turnId: null,
+    turnTimestamp: null,
+    reason: 'unconfirmed-within-budget',
+  };
+}
+
 function parseEvent(ev) {
   const ts = ev.created_at ?? null;
 
@@ -550,6 +682,11 @@ function parseEvent(ev) {
 async function createPr(sessionId) {
   if (activeSessionId() !== sessionId) await navigateToSession(sessionId);
 
+  // Same misroute class as inject (2026-07-29): the button below is
+  // document-global, so a silently-failed navigation would open a PR on
+  // whichever session the shared tab is still showing.
+  assertParkedOn(sessionId, 'create_pr');
+
   const btn = document.querySelector('button[aria-label="Create PR"]');
   if (!btn)           throw new Error('Create PR button not found');
   if (btn.closest('[data-disabled]')) throw new Error('Create PR button is disabled');
@@ -558,6 +695,10 @@ async function createPr(sessionId) {
 
 async function setCiOptions(sessionId, { autofix, automerge }) {
   if (activeSessionId() !== sessionId) await navigateToSession(sessionId);
+
+  // Global CI button + global checkboxes — same gate as create_pr, or auto-merge
+  // gets flipped on someone else's session.
+  assertParkedOn(sessionId, 'set_ci_options');
 
   const ciDot = document.querySelector(SEL.ciDot);
   const ciBtn = ciDot?.closest('button');
@@ -716,13 +857,48 @@ chrome.runtime.onMessage.addListener((msg) => {
           break;
         }
 
-        case 'inject':
-          await withNavLock(async () => {
+        case 'inject': {
+          // Misroute incident 2026-07-29 ~19:30Z: a prompt intended for one
+          // session was posted into another, and the daemon still answered
+          // `injected: true`. Cause was check-then-act here — `navigateToSession`
+          // reports instead of throwing, and its render wait is satisfied by
+          // SEL.chatInput, which is document-global and therefore already matched
+          // by the OUTGOING session's composer. So a silently-failed navigation
+          // fell straight through to injectPrompt and typed into whatever session
+          // was still mounted. `readBranchBarFresh` had this identity discipline
+          // since the get_state fix; inject never got it.
+          const delivery = await withNavLock(async () => {
             if (activeSessionId() !== msg.sessionId) await navigateToSession(msg.sessionId);
-            await injectPrompt(msg.prompt);
+
+            // Hard gate — never type blind. Cheap, and the whole defence.
+            assertParkedOn(msg.sessionId, 'inject');
+
+            // Baseline for proof-of-delivery, from the session-keyed events API
+            // rather than the DOM (see sessionEventHead). Best-effort: if the API
+            // is unavailable we still inject, we just report verified:false —
+            // confirmInjected refuses to guess without a baseline.
+            let before = null;
+            try { before = await sessionEventHead(msg.sessionId, 5000); } catch {}
+
+            await injectPrompt(msg.prompt, { sessionId: msg.sessionId });
+
+            // Re-check identity AFTER submitting: if a concurrent request moved
+            // the tab mid-submit, say so rather than reporting a clean success.
+            const stillParked = activeSessionId() === msg.sessionId
+                             && sessionIdFromUrl() === msg.sessionId;
+
+            const confirmation = await confirmInjected(msg.sessionId, msg.prompt, before);
+            return { ...confirmation, stillParked };
           });
-          respond(requestId, { ok: true });
+
+          relayLog(
+            `inject ${msg.sessionId}: verified=${delivery.verified} ` +
+            `turnId=${delivery.turnId ?? 'none'} stillParked=${delivery.stillParked}` +
+            (delivery.reason ? ` reason=${delivery.reason}` : '')
+          );
+          respond(requestId, { ok: true, ...delivery });
           break;
+        }
 
         case 'create_session': {
           const sessionId = await withNavLock(() => createSession({
