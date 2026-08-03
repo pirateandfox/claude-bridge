@@ -139,9 +139,17 @@ sudo systemctl restart claude-bridge.service
 
 On a headless Linux box, Chrome must run inside the virtual display with the extension loaded and at least one `claude.ai` tab open for `/health` to report `"chrome": true`. The daemon itself has no display dependency, but the end-to-end bridge does.
 
-Run the daemon as the same user that owns the Chrome profile, for example `pf`. Native messaging hosts are spawned by Chrome as that user, and the manifest must live in that user's browser profile directory under `~/.config/.../NativeMessagingHosts/`.
+Run the daemon as the same user that owns the Chrome profile, for example
+`ansible` on a Qalatra fleet node. Native messaging hosts are spawned by Chrome
+as that user, and the manifest must live in that user's normal browser profile
+under `~/.config/google-chrome/NativeMessagingHosts/`.
 
-For fleet images, keep the unpacked extension ID stable by adding a fixed `"key"` field to `extension/manifest.json`. Generate one keypair, bake the public key into the manifest, and every cloned appliance will use the same extension ID for the native-host `allowed_origins` entry.
+Fleet nodes use the signed `.crx`, not an unpacked extension. The CRX signing
+key determines the stable extension ID
+`ngcgcpjkgflmonjaoaclipefffngbfhd`; the matching public key is safe to commit in
+`extension/manifest.json`. The native-host manifest must continue to list that
+ID in `allowed_origins`. Increasing the manifest version does not change the ID
+as long as every release is signed with the same private key.
 
 ## Updating
 
@@ -149,19 +157,30 @@ For fleet images, keep the unpacked extension ID stable by adding a fixed `"key"
 
 Fleet Chrome runs normally, without remote-debugging or unsafe-extension flags.
 Tagged releases package the extension with the repository's protected signing
-key and publish `claude-bridge.crx` plus its checksum. The fleet playbook
-installs that package through Chrome's supported Linux external-extension
-mechanism.
+key and publish `claude-bridge.crx` plus its checksum. The private key is stored
+as the `EXTENSION_SIGNING_KEY_B64` GitHub Actions repository secret; it is never
+committed or installed on fleet nodes. GitHub secrets are write-only after they
+are saved, so maintain an independent encrypted backup of this key in a secure
+vault. The release workflow decodes it only into the ephemeral runner's
+temporary directory.
+
+The fleet playbook installs the resulting package through Chrome's supported
+Linux external-extension mechanism.
 
 See the [releases page](../../releases) for packaged `.crx` files.
 
-To create a release, increment `extension/manifest.json`'s version, commit it,
-then push the matching tag. For example:
+To create a release, increment `extension/manifest.json`'s version, commit and
+push it, then push the matching tag. Always use the existing signing key. For
+example:
 
 ```bash
-git tag v0.1.1
-git push origin v0.1.1
+git tag -a v0.1.2 -m "Claude Bridge v0.1.2"
+git push origin develop v0.1.2
 ```
+
+After GitHub publishes the release, update Qalatra Fleet's pinned CRX version,
+release URL, and SHA-256 checksum. Do not change the extension ID unless the
+signing key was intentionally rotated.
 
 For a local package test, keep the private key outside the repository:
 
