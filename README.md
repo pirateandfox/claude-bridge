@@ -59,7 +59,7 @@ git clone https://github.com/pirateandfox/claude-bridge.git
 cd claude-bridge
 ```
 
-**2. Load the extension in Chrome**
+**2. Load the extension in Chrome for development**
 
 - Go to `chrome://extensions`
 - Enable **Developer mode** (top right toggle)
@@ -145,11 +145,29 @@ For fleet images, keep the unpacked extension ID stable by adding a fixed `"key"
 
 ## Updating
 
-### Auto-updates (via self-hosted .crx)
+### Fleet releases (signed `.crx`)
 
-The extension manifest includes an `update_url` pointing to GitHub Pages. Once you've set up a signed `.crx` and an `updates.xml` file on `gh-pages`, Chrome polls for updates and installs them silently.
+Fleet Chrome runs normally, without remote-debugging or unsafe-extension flags.
+Tagged releases package the extension with the repository's protected signing
+key and publish `claude-bridge.crx` plus its checksum. The fleet playbook
+installs that package through Chrome's supported Linux external-extension
+mechanism.
 
 See the [releases page](../../releases) for packaged `.crx` files.
+
+To create a release, increment `extension/manifest.json`'s version, commit it,
+then push the matching tag. For example:
+
+```bash
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+For a local package test, keep the private key outside the repository:
+
+```bash
+scripts/package-extension.sh /secure/path/extension.pem dist/claude-bridge.crx
+```
 
 ### Manual updates
 
