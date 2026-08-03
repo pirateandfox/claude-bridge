@@ -938,7 +938,27 @@ chrome.runtime.onMessage.addListener((msg) => {
 
         case 'get_state': {
           const row = document.querySelector(`[data-row-key="code:${msg.sessionId}"]`);
-          if (!row) { respond(requestId, { ok: false, error: 'Session not found' }); break; }
+          if (!row) {
+            // Archived sessions are not rendered in the sidebar at all, so there
+            // is no row to click and the UI-scraped fields are unreachable — but
+            // the API still knows the session. Answer with metadata and return
+            // the scraped fields as null rather than failing the whole call, so
+            // "this id is archived" is distinguishable from "this id is bogus".
+            const meta = await readSessionMeta(msg.sessionId);
+            if (!meta) { respond(requestId, { ok: false, error: 'Session not found' }); break; }
+            relayLog(`get_state ${msg.sessionId}: no sidebar row (archived?) — metadata only (worker=${meta.workerStatus ?? 'n/a'} bucket=${meta.statusBucket ?? 'n/a'})`);
+            respond(requestId, {
+              ok: true,
+              state:        deriveSessionState(meta, 'unknown'),
+              statusBucket: meta.statusBucket ?? null,
+              workerStatus: meta.workerStatus ?? null,
+              branchBar: null,
+              model:     null,
+              effort:    null,
+              usagePct:  null,
+            });
+            break;
+          }
 
           // EVERYTHING that scrapes session-scoped UI (branch bar, model, effort,
           // usage) must run inside the nav lock and while the tab is confirmed
