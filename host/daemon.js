@@ -154,7 +154,7 @@ createNetServer((sock) => {
 const TOOLS = [
   {
     name: 'claude_sessions_list',
-    description: 'List active (non-archived) Claude Code cloud sessions — the ones still visible in the sidebar. Archived sessions are finished work retained only for history and are excluded by default; pass include_archived: true to get the full account history instead.',
+    description: 'List active (non-archived) Claude Code cloud sessions — the ones still visible in the sidebar. Archived sessions are finished work retained only for history and are excluded by default; pass include_archived: true to get the full account history instead. Each row carries workerStatus (idle|… — the reliable busy/idle signal) and statusBucket, whose semantics are UNVERIFIED and must not be routed on — see claude_session_get_state for what has been ruled out.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -173,7 +173,7 @@ const TOOLS = [
   },
   {
     name: 'claude_session_get_state',
-    description: 'Get detailed state for a specific session. `state` (running/ready/archived/unknown) now comes from the API, so it is reliable without warming — "running" means the session is actually working, "unknown" means neither the API nor the DOM could answer and must be treated as busy, never as idle. Also returns workerStatus (idle|… — the raw busy signal) and statusBucket (review_ready|blocked|completed|failed), which is the most useful field for triage. branchBar/prUrl/model/effort are still scraped from the UI and are null until the session has been warmed — that reads as "no PR" rather than "not loaded", so call claude_sessions_warm before a batch read if you need branch data. usagePct is the ACCOUNT plan meter, global and identical for every session.',
+    description: 'Get detailed state for a specific session. `state` (running/ready/archived/unknown) now comes from the API, so it is reliable without warming — "running" means the session is actually working, "unknown" means neither the API nor the DOM could answer and must be treated as busy, never as idle. Also returns workerStatus (idle|… — the raw busy signal; this one is reliable) and statusBucket (review_ready|blocked|completed|failed). WARNING: statusBucket semantics are UNVERIFIED — do NOT route work on it. It is passed through raw for observation only. Ruled out on 2026-08-03: it is not "PR merged" (two blocked sessions had open PRs), not derived from PR state (an open+conflicting PR appeared in both buckets), and not "ended asking a human" (a blocked session asked nothing; a review_ready one asked). A merged, finished session still reads "blocked", so it does not clear on completion and cannot mean "needs attention". branchBar/prUrl/model/effort are still scraped from the UI and are null until the session has been warmed — that reads as "no PR" rather than "not loaded", so call claude_sessions_warm before a batch read if you need branch data. usagePct is the ACCOUNT plan meter, global and identical for every session.',
     inputSchema: {
       type: 'object',
       properties: {

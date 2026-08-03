@@ -206,10 +206,18 @@ async function readSessions(includeArchived = false) {
     const mapSession = s => ({
       sessionId: String(s.id ?? '').replace(/^cse_/, 'session_'),
       title:     s.title ?? '',
-      // Surfaced because they are the fields worth triaging on: statusBucket is
-      // review_ready|blocked|completed|failed, and workerStatus is the only
-      // trustworthy busy/idle signal (the sidebar's aria-label is not — it read
-      // "Running" for sessions the API reports idle, one with a merged PR).
+      // workerStatus is the only trustworthy busy/idle signal — the sidebar's
+      // aria-label is not (it read "Running" for sessions the API reports idle,
+      // one with an already-merged PR).
+      //
+      // statusBucket is passed through RAW FOR OBSERVATION ONLY. Its semantics
+      // are unverified: on 2026-08-03 it was not "PR merged" (two blocked
+      // sessions had open PRs), not derived from PR state (an open+conflicting
+      // PR appeared in both buckets), and not "ended asking a human" (a blocked
+      // session asked nothing, a review_ready one asked). A merged and finished
+      // session still read "blocked", so it does not clear on completion. Kept
+      // because watching it move across a live pipeline is the only way to learn
+      // what drives it — but nothing should route on it until that is known.
       statusBucket: s.status_bucket ?? null,
       workerStatus: s.worker_status ?? null,
       // `session_status` does not exist on this API (confirmed 2026-08-03 — the
