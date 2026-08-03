@@ -206,6 +206,12 @@ async function readSessions(includeArchived = false) {
     const mapSession = s => ({
       sessionId: String(s.id ?? '').replace(/^cse_/, 'session_'),
       title:     s.title ?? '',
+      // Surfaced because they are the fields worth triaging on: statusBucket is
+      // review_ready|blocked|completed|failed, and workerStatus is the only
+      // trustworthy busy/idle signal (the sidebar's aria-label is not — it read
+      // "Running" for sessions the API reports idle, one with a merged PR).
+      statusBucket: s.status_bucket ?? null,
+      workerStatus: s.worker_status ?? null,
       // `session_status` does not exist on this API (confirmed 2026-08-03 — the
       // old code read it and silently got undefined for every row). `status` is
       // the session's own state; `worker_status` describes its container, used
@@ -250,6 +256,40 @@ async function readSessions(includeArchived = false) {
     relayLog(`DOM fallback — ${domSessions.length} session(s)`);
     return domSessions;
   }
+}
+
+// Authoritative session state, from the API rather than the sidebar DOM.
+//
+// get_state used to derive `state` from the row's [role="status"] aria-label,
+// which is wrong twice over: it is absent for any row the sidebar has not
+// rendered (so unwarmed reads fell back to a default), and when present it has
+// disagreed with the API outright — reading "Running" for sessions the API
+// reports worker_status:idle, including one whose PR had already merged.
+//
+// Includes archived sessions on purpose: get_state should answer for any id the
+// caller holds, not only the ones currently in the sidebar.
+async function readSessionMeta(sessionId) {
+  try {
+    const all = await readSessions(true);
+    return all.find(s => s.sessionId === sessionId) ?? null;
+  } catch (e) {
+    relayLog(`session meta lookup failed for ${sessionId} (${e.message})`);
+    return null;
+  }
+}
+
+// Collapse API metadata into the state vocabulary callers already expect.
+// Falls back to the DOM reading only when the API told us nothing, and to
+// 'unknown' rather than 'ready' when neither source could answer — an
+// unreadable session must never be reported as idle.
+function deriveSessionState(meta, domState) {
+  if (meta) {
+    const worker = String(meta.workerStatus ?? '').toLowerCase();
+    if (worker && worker !== 'idle') return 'running';
+    if (String(meta.state ?? '').toLowerCase() === 'archived') return 'archived';
+    if (worker === 'idle') return 'ready';
+  }
+  return domState && domState !== 'unknown' ? domState : 'unknown';
 }
 
 function readBranchBar() {
@@ -950,11 +990,16 @@ chrome.runtime.onMessage.addListener((msg) => {
           // prUrl comes straight off the PR link in readBranchBar — no /v1/sessions
           // fetch needed (that had no timeout and could itself hang under the same
           // background-tab conditions).
-          const gsState = readRowState(row);
-          relayLog(`get_state ${msg.sessionId}: state=${gsState} branch=${scraped.branchBar?.featureBranch ?? 'none'} usagePct=${scraped.usagePct ?? 'n/a'}`);
+          // State comes from the API, not the row — see readSessionMeta. The DOM
+          // reading is kept only as a fallback for when the API cannot answer.
+          const gsMeta  = await readSessionMeta(msg.sessionId);
+          const gsState = deriveSessionState(gsMeta, readRowState(row));
+          relayLog(`get_state ${msg.sessionId}: state=${gsState} (worker=${gsMeta?.workerStatus ?? 'n/a'} bucket=${gsMeta?.statusBucket ?? 'n/a'}) branch=${scraped.branchBar?.featureBranch ?? 'none'} usagePct=${scraped.usagePct ?? 'n/a'}`);
           respond(requestId, {
             ok: true,
             state: gsState,
+            statusBucket: gsMeta?.statusBucket ?? null,
+            workerStatus: gsMeta?.workerStatus ?? null,
             branchBar: scraped.branchBar,
             model:     scraped.model,
             effort:    scraped.effort,

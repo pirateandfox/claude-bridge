@@ -173,7 +173,7 @@ const TOOLS = [
   },
   {
     name: 'claude_session_get_state',
-    description: 'Get detailed state for a specific session: running/ready/merged/pr_open/unknown, branch info, CI status, model, effort. IMPORTANT: "unknown" means the row could not be read (not hydrated yet) — it does NOT mean idle. Call claude_sessions_warm and re-read before concluding a session is free; if you must act on an unknown, treat it as busy. branchBar/prUrl are also null until the session has been warmed, which reads as "no PR" rather than "not loaded" — so warm before any batch read. Also returns usagePct — the ACCOUNT plan usage % ("Usage: plan N%"), which is global, NOT per-session (same value for every session).',
+    description: 'Get detailed state for a specific session. `state` (running/ready/archived/unknown) now comes from the API, so it is reliable without warming — "running" means the session is actually working, "unknown" means neither the API nor the DOM could answer and must be treated as busy, never as idle. Also returns workerStatus (idle|… — the raw busy signal) and statusBucket (review_ready|blocked|completed|failed), which is the most useful field for triage. branchBar/prUrl/model/effort are still scraped from the UI and are null until the session has been warmed — that reads as "no PR" rather than "not loaded", so call claude_sessions_warm before a batch read if you need branch data. usagePct is the ACCOUNT plan meter, global and identical for every session.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -291,7 +291,7 @@ function createMcpServer() {
         }
         case 'claude_session_get_state': {
           const r = await sendToChrome('get_state', { sessionId: args.session_id });
-          result  = { state: r.state, branchBar: r.branchBar, prUrl: r.branchBar?.prUrl ?? null, model: r.model, effort: r.effort, usagePct: r.usagePct };
+          result  = { state: r.state, statusBucket: r.statusBucket ?? null, workerStatus: r.workerStatus ?? null, branchBar: r.branchBar, prUrl: r.branchBar?.prUrl ?? null, model: r.model, effort: r.effort, usagePct: r.usagePct };
           break;
         }
         case 'claude_session_inject': {
