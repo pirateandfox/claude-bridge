@@ -106,7 +106,26 @@ const SESSION_LIST_ENDPOINTS = [
   '/v1/sessions?limit=100',
 ];
 
-async function readSessions() {
+// Archived-session detection. The API field is undocumented and this route has
+// already moved once, so check every plausible marker rather than betting on
+// one. Deliberately conservative: an unrecognised shape falls through to "not
+// archived", which over-reports the open list rather than silently hiding live
+// work — the safe direction for a caller deciding what still needs attention.
+// Tighten this once the "sessions API fields/status counts" log lines confirm
+// the real marker.
+function isArchivedSession(s) {
+  if (s.archived_at != null || s.archivedAt != null) return true;
+  if (s.is_archived === true || s.archived === true) return true;
+  // The live API (2026-08-03) exposes `status` and `status_bucket`, not the
+  // `session_status` the old code read. Substring-match so a bucket like
+  // "archived"/"is_archived" is caught regardless of exact casing or wording.
+  for (const v of [s.status, s.status_bucket]) {
+    if (String(v ?? '').toLowerCase().includes('archiv')) return true;
+  }
+  return false;
+}
+
+async function readSessions(includeArchived = false) {
   try {
     // On a cold/remote box the very first fetch often times out before the SPA
     // has fully booted. Retry the timeout/network case a couple times with a
@@ -156,12 +175,53 @@ async function readSessions() {
     if (resp.status === 401 || resp.status === 403) throw new Error('NOT_AUTHENTICATED');
     if (!resp.ok) throw new Error(`Sessions API ${resp.status}`);
     const data = await resp.json();
-    const apiSessions = (data.data ?? []).map(s => ({
-      sessionId: s.id,
+    const rawSessions = data.data ?? [];
+
+    // One-time shape diagnostic. The archived marker is not documented anywhere
+    // we control and claude.ai has already moved this route once, so record the
+    // available fields and the status distribution rather than trusting
+    // isArchivedSession's guesses silently. If the filter ever drops the wrong
+    // rows, these two lines say exactly what to key it on instead.
+    if (rawSessions.length) {
+      relayLog(`sessions API fields: ${Object.keys(rawSessions[0]).join(',')}`);
+      // Distribution of every status-shaped field. These are enums, not content,
+      // so this is safe to log and it is the only way to learn which one marks a
+      // session archived without guessing another round.
+      for (const field of ['status', 'status_bucket', 'worker_status', 'connection_status', 'environment_kind']) {
+        const counts = {};
+        for (const s of rawSessions) {
+          const k = String(s[field] ?? '(none)');
+          counts[k] = (counts[k] ?? 0) + 1;
+        }
+        relayLog(`sessions API ${field}: ${JSON.stringify(counts)}`);
+      }
+    }
+
+    // Normalise back to the `session_` prefix. That is this bridge's canonical
+    // external id — the sidebar keys rows `code:session_…`, /code/<id> URLs use
+    // it, and every other command resolves a DOM row by it. The API speaks
+    // `cse_` (readTranscript converts the other way for the same reason), so
+    // returning s.id raw would hand callers ids that get_state, inject and
+    // archive all reject with "Session not found".
+    const mapSession = s => ({
+      sessionId: String(s.id ?? '').replace(/^cse_/, 'session_'),
       title:     s.title ?? '',
-      state:     s.session_status ?? 'ready',
+      // `session_status` does not exist on this API (confirmed 2026-08-03 — the
+      // old code read it and silently got undefined for every row). `status` is
+      // the session's own state; `worker_status` describes its container, used
+      // only as a fallback.
+      state:     s.status ?? s.worker_status ?? 'unknown',
       repo:      s.session_context?.outcomes?.[0]?.git_info?.repo ?? null,
-    }));
+    });
+
+    // Archived sessions are finished work kept only for history — they are gone
+    // from the sidebar, and including them turned a 9-row "what is open" list
+    // into 46 rows of mostly-closed tickets. Filter by default; callers wanting
+    // history pass include_archived.
+    const visible = includeArchived ? rawSessions : rawSessions.filter(s => !isArchivedSession(s));
+    const hidden  = rawSessions.length - visible.length;
+    if (hidden > 0) relayLog(`sessions API filtered ${hidden} archived session(s)`);
+    const apiSessions = visible.map(mapSession);
     // An empty API result is ambiguous on a cold/booting page: /v1/sessions can
     // return {data: []} transiently while the SPA's workspace context is still
     // being established (cookies present, sessions not yet indexed). Only trust
@@ -823,7 +883,9 @@ chrome.runtime.onMessage.addListener((msg) => {
       switch (msg.cmd) {
 
         case 'list_sessions': {
-          const sessions = await readSessions();
+          // The DOM fallback inside readSessions needs no filtering — the
+          // sidebar only renders non-archived rows in the first place.
+          const sessions = await readSessions(msg.includeArchived === true);
           respond(requestId, { ok: true, sessions });
           break;
         }

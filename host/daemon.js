@@ -154,8 +154,17 @@ createNetServer((sock) => {
 const TOOLS = [
   {
     name: 'claude_sessions_list',
-    description: 'List all Claude Code cloud sessions visible in the sidebar.',
-    inputSchema: { type: 'object', properties: {}, required: [] },
+    description: 'List active (non-archived) Claude Code cloud sessions — the ones still visible in the sidebar. Archived sessions are finished work retained only for history and are excluded by default; pass include_archived: true to get the full account history instead.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        include_archived: {
+          type: 'boolean',
+          description: 'Include archived sessions (finished work kept for history). Defaults to false.',
+        },
+      },
+      required: [],
+    },
   },
   {
     name: 'claude_sessions_warm',
@@ -271,7 +280,7 @@ function createMcpServer() {
 
       switch (name) {
         case 'claude_sessions_list': {
-          const r = await sendToChrome('list_sessions');
+          const r = await sendToChrome('list_sessions', { includeArchived: args.include_archived === true });
           result  = r.sessions;
           break;
         }
