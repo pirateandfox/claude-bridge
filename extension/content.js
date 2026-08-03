@@ -21,6 +21,15 @@ function sessionIdFromKey(rowKey) {
   return rowKey.replace(/^code:/, '');
 }
 
+// Returns 'unknown' — never 'ready' — when the row carries no readable status.
+// An unhydrated row (sidebar virtualised, page still booting, or a selector that
+// claude.ai has since renamed) looks identical to an idle one, and this used to
+// default to 'ready': "I could not read this" was reported as "this session is
+// idle", indistinguishably and with no signal that it had guessed. That is the
+// dangerous direction — a caller deciding whether to dispatch work reads the
+// guess as a green light and pushes on top of a live session. Callers that need
+// certainty should warm first (see warmAllSessions) and re-read; callers that
+// cannot tolerate 'unknown' should treat it as busy, not idle.
 function readRowState(row) {
   const statusEl = row.querySelector(SEL.rowStatus);
   if (statusEl) {
@@ -35,7 +44,7 @@ function readRowState(row) {
     if (label.includes('open'))   return 'pr_open';
     if (label.includes('closed')) return 'pr_closed';
   }
-  return 'ready';
+  return 'unknown';
 }
 
 function readSessionsFromDom() {
@@ -84,27 +93,62 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = 8000) {
   }
 }
 
+// Candidate list endpoints, tried in order. `/v1/sessions` began returning 404
+// (observed 2026-08-03) while the per-session endpoints this file already uses
+// — `/v1/code/sessions/<id>/events` — kept working, so the collection almost
+// certainly moved under the `/v1/code` root alongside them. Probing rather than
+// hard-switching means a wrong guess degrades to the next candidate instead of
+// silently forcing every caller onto the DOM path, and the relayLog line below
+// records which one actually answered so this is diagnosable from the log alone.
+// If the 404 candidate is still dead months from now, delete it.
+const SESSION_LIST_ENDPOINTS = [
+  '/v1/code/sessions?limit=100',
+  '/v1/sessions?limit=100',
+];
+
 async function readSessions() {
   try {
     // On a cold/remote box the very first fetch often times out before the SPA
     // has fully booted. Retry the timeout/network case a couple times with a
     // short backoff so a single cold miss doesn't fall straight to the DOM.
     let resp;
+    let usedEndpoint = null;
     for (let attempt = 1; ; attempt++) {
-      try {
-        resp = await fetchWithTimeout('/v1/sessions?limit=100', {
-          credentials: 'include',
-          headers: {
-            'anthropic-beta':    'managed-agents-2026-04-01',
-            'anthropic-version': '2023-06-01',
-          },
-        }, 8000);
-        break;
-      } catch (e) {
-        if (attempt >= 3) throw e;
-        relayLog(`sessions API attempt ${attempt} failed (${e.message}); retrying`);
-        await sleep(750 * attempt);
+      let lastErr = null;
+      for (const endpoint of SESSION_LIST_ENDPOINTS) {
+        try {
+          const r = await fetchWithTimeout(endpoint, {
+            credentials: 'include',
+            headers: {
+              'anthropic-beta':    'managed-agents-2026-04-01',
+              'anthropic-version': '2023-06-01',
+            },
+          }, 8000);
+          // 404 means "not this path" — keep probing. Auth failures and other
+          // statuses are about the request, not the route, so stop and let the
+          // existing handling below classify them.
+          if (r.status === 404) {
+            relayLog(`sessions API ${endpoint} → 404; trying next candidate`);
+            continue;
+          }
+          resp = r;
+          usedEndpoint = endpoint;
+          break;
+        } catch (e) {
+          lastErr = e;
+          // network/timeout on this candidate — try the next before burning a retry
+          relayLog(`sessions API ${endpoint} errored (${e.message}); trying next candidate`);
+        }
       }
+      if (resp) break;
+      // Retries exist for the cold-boot timeout case only. If every candidate
+      // answered 404 (lastErr still null — no exception was thrown), the routes
+      // are simply gone and retrying just burns two more round trips per attempt
+      // before the same fallback. Fail straight through to the DOM path.
+      if (!lastErr) throw new Error('Sessions API 404 on all candidate endpoints');
+      if (attempt >= 3) throw lastErr;
+      relayLog(`sessions API attempt ${attempt} exhausted all candidates; retrying`);
+      await sleep(750 * attempt);
     }
     // 401/403 means the bridge's Chrome isn't signed in to claude.ai. The DOM
     // fallback is useless here (a logged-out page has no session rows either), so
@@ -132,7 +176,7 @@ async function readSessions() {
         return domSessions;
       }
     }
-    relayLog(`sessions API ok — ${apiSessions.length} session(s)`);
+    relayLog(`sessions API ok via ${usedEndpoint} — ${apiSessions.length} session(s)`);
     return apiSessions;
   } catch (e) {
     // Auth failure is a real, user-fixable condition — propagate it verbatim so
@@ -952,6 +996,10 @@ function checkStateChanges() {
   for (const row of document.querySelectorAll(SEL.sessionRow)) {
     const sessionId = sessionIdFromKey(row.getAttribute('data-row-key'));
     const state     = readRowState(row);
+    // An unreadable row is not a transition. Skip without recording, so the
+    // genuine state still emits once the row hydrates rather than being
+    // swallowed as "already seen".
+    if (state === 'unknown') continue;
     if (lastStates[sessionId] !== state) {
       lastStates[sessionId] = state;
       try { chrome.runtime.sendMessage({ type: 'state_change', sessionId, state }).catch(() => {}); } catch {}

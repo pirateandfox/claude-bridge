@@ -164,7 +164,7 @@ const TOOLS = [
   },
   {
     name: 'claude_session_get_state',
-    description: 'Get detailed state for a specific session: running/ready/merged/pr_open, branch info, CI status, model, effort. Also returns usagePct — the ACCOUNT plan usage % ("Usage: plan N%"), which is global, NOT per-session (same value for every session).',
+    description: 'Get detailed state for a specific session: running/ready/merged/pr_open/unknown, branch info, CI status, model, effort. IMPORTANT: "unknown" means the row could not be read (not hydrated yet) — it does NOT mean idle. Call claude_sessions_warm and re-read before concluding a session is free; if you must act on an unknown, treat it as busy. branchBar/prUrl are also null until the session has been warmed, which reads as "no PR" rather than "not loaded" — so warm before any batch read. Also returns usagePct — the ACCOUNT plan usage % ("Usage: plan N%"), which is global, NOT per-session (same value for every session).',
     inputSchema: {
       type: 'object',
       properties: {
