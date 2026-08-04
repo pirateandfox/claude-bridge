@@ -161,8 +161,9 @@ key and publish `claude-bridge.crx` plus its checksum. The private key is stored
 as the `EXTENSION_SIGNING_KEY_B64` GitHub Actions repository secret; it is never
 committed or installed on fleet nodes. GitHub secrets are write-only after they
 are saved, so maintain an independent encrypted backup of this key in a secure
-vault. The release workflow decodes it only into the ephemeral runner's
-temporary directory.
+vault. The verified recovery copy is stored in the Pirate & Fox 1Password
+Employee vault as `Claude Bridge CRX Signing Key`. The release workflow decodes
+the GitHub copy only into the ephemeral runner's temporary directory.
 
 The fleet playbook installs the resulting package through Chrome's supported
 Linux external-extension mechanism.
