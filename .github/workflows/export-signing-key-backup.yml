@@ -1,0 +1,44 @@
+name: Export encrypted signing-key backup
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Encrypt signing key for the local transfer recipient
+        env:
+          EXTENSION_SIGNING_KEY_B64: ${{ secrets.EXTENSION_SIGNING_KEY_B64 }}
+          BACKUP_GPG_PUBLIC_KEY_B64: ${{ secrets.CLAUDE_BRIDGE_BACKUP_GPG_PUBLIC_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          test -n "$EXTENSION_SIGNING_KEY_B64"
+          test -n "$BACKUP_GPG_PUBLIC_KEY_B64"
+
+          printf '%s' "$BACKUP_GPG_PUBLIC_KEY_B64" \
+            | base64 --decode > "$RUNNER_TEMP/recipient.asc"
+          gpg --batch --import "$RUNNER_TEMP/recipient.asc"
+          recipient="$(gpg --batch --with-colons --list-keys \
+            | awk -F: '/^fpr:/{print $10; exit}')"
+          test -n "$recipient"
+
+          printf '%s' "$EXTENSION_SIGNING_KEY_B64" \
+            | base64 --decode > "$RUNNER_TEMP/extension.pem"
+          chmod 600 "$RUNNER_TEMP/extension.pem"
+          gpg --batch --yes --trust-model always \
+            --recipient "$recipient" \
+            --output "$RUNNER_TEMP/extension.pem.gpg" \
+            --encrypt "$RUNNER_TEMP/extension.pem"
+          rm -f "$RUNNER_TEMP/extension.pem"
+
+      - name: Upload encrypted backup
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-bridge-signing-key-encrypted
+          path: ${{ runner.temp }}/extension.pem.gpg
+          if-no-files-found: error
+          retention-days: 1
