@@ -12,8 +12,17 @@ const SEL = {
   chatInput:     'div[contenteditable="true"][aria-label="Prompt"]',
   sendBtn:       'button[aria-label="Send"]',
   usageBtn:      '[aria-label^="Usage:"]',
-  repoTrigger:   'button[role="combobox"][aria-label="Add repository"]',  // "Select repo…" on a new session
-  repoOption:    '[role="option"]',                                       // repo entries in the open picker
+  // The composer chip row is: [Full Access] [repo] [branch] [+]. The repo and
+  // branch chips are BOTH bare button[role="combobox"] — no aria-label, no
+  // testid, identical classes — so markup alone cannot tell them apart. The "+"
+  // is the one carrying aria-label="Add repository"; it opens the ADD-ANOTHER-
+  // repo picker, which excludes repos already attached and therefore can never
+  // find the current one. Keying on that label was the 2026-08-08 "No repos
+  // match" bug. Chips are identified by their hidden input instead — see
+  // chipValue().
+  repoTrigger:   'button[role="combobox"]',                               // any chip; disambiguated by chipValue()
+  addRepoBtn:    'button[role="combobox"][aria-label="Add repository"]',  // the "+" — never click for selection
+  repoOption:    '[role="option"], [cmdk-item], [role="menuitemradio"]',  // repo entries in the open picker
   repoSearch:    'input[placeholder="Search repos…"]',               // type-to-filter input (… is U+2026)
 };
 
@@ -584,56 +593,126 @@ async function injectPrompt(text, { sessionId } = {}) {
 // without one — clicking "New session" opens a composer with an empty
 // "Select repo…" combobox, and submitting a prompt with no repo is a no-op.
 async function selectRepo(repo) {
-  const trigger = document.querySelector(SEL.repoTrigger);
+  const trigger = repoTriggerEl();
   if (!trigger) throw new Error('Repo picker not found — claude.ai UI may have changed');
+
+  // Already on the requested repo? selectedRepoFullName() comes from the chip's
+  // hidden input, so this is an exact owner/name identity check rather than the
+  // bare-name guess the visible chip would force — safe to skip, and it avoids
+  // opening the picker at all in the common case.
+  const current = selectedRepoFullName();
+  if (current && current.toLowerCase() === repo.toLowerCase()) return;
+
+  // Search and match differ here, and conflating them is the bug (2026-08-08).
+  // The filter is FUZZY and scores against the repo-name segment only, so the
+  // full "owner/name" matches nothing and renders "No repos match" — but the
+  // rendered options ARE labelled "owner/name". So: type the bare name, then
+  // match on the full one.
+  const norm = s => (s || '').trim();
+  const bare = repo.includes('/') ? repo.slice(repo.indexOf('/') + 1) : repo;
 
   trigger.click();
   await pollUntil(() => document.querySelectorAll(SEL.repoOption).length > 0, 3000);
+
+  const matches = o => {
+    const t = norm(o.textContent);
+    return t === repo || t === bare || t.endsWith(`/${bare}`);
+  };
 
   // Best-effort type-to-filter (the list is long and may virtualize on other
   // accounts). Harmless when all options are already in the DOM.
   const search = document.querySelector(SEL.repoSearch) || document.querySelector('input[type="text"]');
   if (search) {
     const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-    setter.call(search, repo);
+    setter.call(search, bare);
     search.dispatchEvent(new Event('input', { bubbles: true }));
     await pollUntil(
-      () => [...document.querySelectorAll(SEL.repoOption)].some(o => o.textContent?.trim() === repo),
+      () => [...document.querySelectorAll(SEL.repoOption)].some(matches),
       2000,
     );
   }
 
-  const norm    = s => (s || '').trim();
   const options = [...document.querySelectorAll(SEL.repoOption)];
   const match   = options.find(o => norm(o.textContent) === repo)
+               || options.find(o => norm(o.textContent) === bare)
                || options.find(o => norm(o.textContent).toLowerCase() === repo.toLowerCase())
-               || options.find(o => norm(o.textContent).endsWith(`/${repo}`));   // allow bare repo name
+               || options.find(o => norm(o.textContent).endsWith(`/${bare}`));
   if (!match) throw new Error(`Repo "${repo}" not found in picker`);
 
   match.click();
   // Wait for the picker to close (combobox collapses) before continuing.
-  await pollUntil(() => document.querySelector(SEL.repoTrigger)?.getAttribute('aria-expanded') !== 'true', 2000);
+  await pollUntil(() => repoTriggerEl()?.getAttribute('aria-expanded') !== 'true', 2000);
 }
 
-// Create a new session. Clicking "New session" only opens a blank composer; the
+// The sidebar control was renamed from "New session" to "New" (claude.ai, Aug
+// 2026), which silently broke createSession. Match either name, and read the
+// accessible name from aria-label as well as text so an icon-only variant still
+// resolves. Widened past SEL.rowMainBtn because the control is no longer a
+// session row.
+function findNewSessionButton() {
+  const name = el => (el.getAttribute('aria-label') || el.textContent || '').trim();
+  const cands = [
+    ...document.querySelectorAll(SEL.rowMainBtn),
+    ...document.querySelectorAll('button, a, [role="button"]'),
+  ];
+  return cands.find(el => /^new(\s+session)?$/i.test(name(el))) || null;
+}
+
+// Each chip is paired with a hidden input `<button-id>-hidden-input` holding its
+// value: the repo chip's is JSON ({name, owner:{login}, default_branch, …}), the
+// branch chip's is a bare string ("develop"), the "+"'s is empty. That value is
+// the only reliable way to tell two otherwise-identical comboboxes apart, and it
+// also yields the exact owner/name — so nothing here has to guess from the
+// chip's visible label, which shows the bare repo name only.
+function chipValue(btn) {
+  const raw = btn?.id && document.getElementById(`${btn.id}-hidden-input`)?.value;
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return raw; }   // branch chips are plain strings
+}
+
+function repoTriggerEl() {
+  const combos = [...document.querySelectorAll(SEL.repoTrigger)]
+    .filter(b => !b.matches(SEL.addRepoBtn));
+  const isRepoChip = b => {
+    const v = chipValue(b);
+    return !!(v && typeof v === 'object' && v.name && v.owner?.login);
+  };
+  // Fall back to the first non-"+" chip for a session with no repo chosen yet,
+  // where there is no JSON value to match on.
+  return combos.find(isRepoChip) ?? combos[0] ?? null;
+}
+
+// Exact "owner/name" of the currently selected repo, or null if none.
+function selectedRepoFullName() {
+  const v = chipValue(repoTriggerEl());
+  return (v && typeof v === 'object' && v.owner?.login && v.name)
+    ? `${v.owner.login}/${v.name}`
+    : null;
+}
+
+// Create a new session. Clicking "New" only opens a blank composer; the
 // session itself is created server-side when the first prompt is submitted, and
 // its ID then appears in the URL. So the order is: open composer → pick repo →
 // set model/effort → submit prompt → read the new ID from the URL.
 async function createSession({ model, effort, prompt, repo } = {}) {
   if (!prompt) throw new Error('A prompt is required to create a session');
 
-  let newBtn = null;
-  for (const btn of document.querySelectorAll(SEL.rowMainBtn)) {
-    if (btn.textContent?.includes('New session')) { newBtn = btn; break; }
-  }
-  if (!newBtn) throw new Error('New session button not found');
+  // /code already mounts a blank composer, so clicking "New" is often
+  // unnecessary — but only skip it when the URL carries no session id. A
+  // composer with an id in the URL belongs to an EXISTING session, and
+  // submitting there would post into that session instead of creating one.
+  const onBlankComposer = () => !sessionIdFromUrl() && !!document.querySelector(SEL.chatInput);
 
-  newBtn.click();
-  // Wait for the blank composer to render (URL drops the previous session id).
-  await pollUntil(() => document.querySelector(SEL.chatInput), 5000);
+  if (!onBlankComposer()) {
+    const newBtn = findNewSessionButton();
+    if (!newBtn) throw new Error('New session control not found — claude.ai UI may have changed');
+    newBtn.click();
+    // Wait for the blank composer to render (URL drops the previous session id).
+    await pollUntil(onBlankComposer, 5000);
+  }
 
   // A repo is now mandatory when the picker is present.
-  if (document.querySelector(SEL.repoTrigger)) {
+  if (repoTriggerEl()) {
     if (!repo) throw new Error('A repo is required to create a session (e.g. "owner/name")');
     await selectRepo(repo);
   }
@@ -765,14 +844,22 @@ const CONFIRM_BUDGET_MS = 15_000;
 // Reports rather than throws: an unconfirmed result returns verified:false and
 // lets the caller check the transcript, instead of raising an error that invites
 // a blind — and possibly duplicating — retry.
-async function confirmInjected(sessionId, prompt, before) {
-  // No baseline means we cannot distinguish a new turn from one already present.
+// `baseline` is { ok, head } — NOT a bare head. A session with no user turns yet
+// has head === null, which is a perfectly usable baseline; only ok:false means we
+// failed to read one. Collapsing those two into a bare null was the 2026-08-08
+// bug: every inject into a fresh session reported verified:false despite landing,
+// and the documented remedy for that ("read the transcript before retrying")
+// invites a double-post from any caller that skips it.
+async function confirmInjected(sessionId, prompt, baseline) {
+  // A failed read means we cannot distinguish a new turn from one already present.
   // That matters most on a RETRY of a prompt that already landed: the newest turn
   // is then our own text from the previous attempt, so a failed injection would
   // read as verified. Report unverifiable rather than guessing.
-  if (!before) {
+  if (!baseline?.ok) {
     return { verified: false, turnId: null, turnTimestamp: null, reason: 'no-baseline' };
   }
+
+  const before = baseline.head;   // null is valid: the session had no user turns
 
   const wanted   = normText(prompt).slice(0, 80);
   const deadline = Date.now() + CONFIRM_BUDGET_MS;
@@ -786,7 +873,9 @@ async function confirmInjected(sessionId, prompt, before) {
     catch { continue; }               // transient API blip — keep waiting
     if (!head) continue;
 
-    const isNew = (head.id && before.id && head.id !== before.id)
+    // No prior user turn at all → the first one to appear is necessarily ours.
+    const isNew = !before
+               || (head.id && before.id && head.id !== before.id)
                || head.timestamp !== before.timestamp;
 
     if (isNew && (!wanted || normText(head.text).includes(wanted))) {
@@ -1056,8 +1145,20 @@ chrome.runtime.onMessage.addListener((msg) => {
             // rather than the DOM (see sessionEventHead). Best-effort: if the API
             // is unavailable we still inject, we just report verified:false —
             // confirmInjected refuses to guess without a baseline.
-            let before = null;
-            try { before = await sessionEventHead(msg.sessionId, 5000); } catch {}
+            //
+            // Keep ok and head separate: sessionEventHead returns null for "no
+            // user turns yet" but THROWS on API failure, and only the latter is
+            // unverifiable. Retry a transient failure rather than silently
+            // spending the whole inject as unverified.
+            let baseline = { ok: false, head: null };
+            for (let attempt = 0; attempt < 3; attempt++) {
+              try {
+                baseline = { ok: true, head: await sessionEventHead(msg.sessionId, 5000) };
+                break;
+              } catch {
+                await sleep(400);
+              }
+            }
 
             await injectPrompt(msg.prompt, { sessionId: msg.sessionId });
 
@@ -1066,7 +1167,7 @@ chrome.runtime.onMessage.addListener((msg) => {
             const stillParked = activeSessionId() === msg.sessionId
                              && sessionIdFromUrl() === msg.sessionId;
 
-            const confirmation = await confirmInjected(msg.sessionId, msg.prompt, before);
+            const confirmation = await confirmInjected(msg.sessionId, msg.prompt, baseline);
             return { ...confirmation, stillParked };
           });
 
