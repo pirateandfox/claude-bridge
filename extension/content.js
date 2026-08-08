@@ -712,13 +712,31 @@ async function selectRepo(repo) {
 // accessible name from aria-label as well as text so an icon-only variant still
 // resolves. Widened past SEL.rowMainBtn because the control is no longer a
 // session row.
+// Controls in this UI split their label, keyboard-shortcut hint and icon across
+// separate spans, so textContent concatenates them ("New⇧⌘O", "Opus 51"). Every
+// exact-match selector written against textContent has therefore failed at least
+// once. Collect all plausible labels — aria-label, each span, the whole text —
+// and test with word-boundary prefixes rather than equality.
+function controlLabels(el) {
+  const out = [];
+  const aria = el.getAttribute('aria-label');
+  if (aria) out.push(aria.trim());
+  el.querySelectorAll('span').forEach(s => {
+    const t = (s.textContent || '').trim();
+    if (t) out.push(t);
+  });
+  const whole = (el.textContent || '').trim();
+  if (whole) out.push(whole);
+  return out;
+}
+
 function findNewSessionButton() {
-  const name = el => (el.getAttribute('aria-label') || el.textContent || '').trim();
+  // \b keeps "New" from matching "Newsletter" while tolerating the shortcut.
   const cands = [
     ...document.querySelectorAll(SEL.rowMainBtn),
     ...document.querySelectorAll('button, a, [role="button"]'),
   ];
-  return cands.find(el => /^new(\s+session)?$/i.test(name(el))) || null;
+  return cands.find(el => controlLabels(el).some(n => /^new(\s+session)?\b/i.test(n))) || null;
 }
 
 // Each chip is paired with a hidden input `<button-id>-hidden-input` holding its
@@ -789,26 +807,66 @@ async function createSession({ model, effort, prompt, repo } = {}) {
   return sessionIdFromUrl();
 }
 
+// Model and effort are SEPARATE chips with separate menus — the old code opened
+// the model menu and looked for both in it, so effort was never settable. It
+// also located the trigger via a .truncate child that no longer holds the model
+// name, which is why it threw "Model button not found".
+//
+// This never throws. createSession calls it before submitting, so a throw meant
+// passing `model` killed the whole kickoff rather than degrading to the account
+// default — the failure was worse than the missing feature. Now it reports what
+// it could not set, and the session still launches.
 async function setModelEffort(model, effort) {
-  let modelBtn = null;
-  for (const btn of document.querySelectorAll('button')) {
-    const t = btn.querySelector('.truncate')?.textContent?.trim() ?? '';
-    if (t.includes('Opus') || t.includes('Sonnet') || t.includes('Haiku')) {
-      modelBtn = btn; break;
-    }
+  // Menu labels put the visible name in .flex-1; a sibling span carries the
+  // keyboard shortcut, so reading textContent directly yields "Opus 51".
+  const labelOf = el => (el.querySelector('.flex-1')?.textContent ?? el.textContent ?? '').trim();
+
+  const chooseFrom = async (btn, want) => {
+    if (!btn) return { ok: false, seen: [] };
+    btn.click();
+    await sleep(250);
+    const items = [...document.querySelectorAll('[role="menuitemradio"], [role="menuitem"]')];
+    const seen  = items.map(labelOf).filter(Boolean);
+    const match = items.find(i => labelOf(i) === want)
+               || items.find(i => labelOf(i).toLowerCase() === want.toLowerCase());
+    if (match) match.click();
+    await sleep(100);
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await sleep(150);
+    return { ok: !!match, seen };
+  };
+
+  // Word-boundary prefixes, not equality: these chips carry shortcut hints too,
+  // so /^High$/ never matched (same trap as "New⇧⌘O").
+  const MODEL_RE  = /\b(opus|sonnet|haiku|fable)\b/i;
+  const EFFORT_RE = /^(low|medium|high|max)\b/i;
+  const findIn    = (root, re) => [...root.querySelectorAll('button')]
+    .filter(b => b.offsetParent)
+    .find(b => controlLabels(b).some(n => re.test(n))) || null;
+
+  // The chips mount a beat after the composer, so wait rather than read once.
+  await pollUntil(() => findIn(document, MODEL_RE), 4000);
+  const modelBtn = findIn(document, MODEL_RE);
+
+  // Effort is resolved ONLY within the model chip's own control row. Searching
+  // the whole document for /^max/ matched the account button ("Justin · Max")
+  // and opened the account menu — one stray label match away from "Log out"
+  // (observed 2026-08-08). No model chip means no known-good row, so leave
+  // effort alone entirely rather than guess at which button it is.
+  const effortBtn = modelBtn ? findIn(modelBtn.parentElement ?? document, EFFORT_RE) : null;
+
+  const problems = [];
+  if (model) {
+    const r = await chooseFrom(modelBtn, model);
+    if (!r.ok) problems.push(`model "${model}" (offered: ${r.seen.join(', ') || 'none — trigger not found'})`);
   }
-  if (!modelBtn) throw new Error('Model button not found');
-
-  modelBtn.click();
-  await sleep(200);
-
-  for (const item of document.querySelectorAll('[role="menuitemradio"]')) {
-    const text = item.querySelector('.flex-1')?.textContent?.trim();
-    if (model  && text === model)  { item.click(); await sleep(100); }
-    if (effort && text === effort) { item.click(); await sleep(100); }
+  if (effort) {
+    const r = await chooseFrom(effortBtn, effort);
+    if (!r.ok) problems.push(`effort "${effort}" (offered: ${r.seen.join(', ') || 'none — trigger not found'})`);
   }
-
-  document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  if (problems.length) {
+    relayLog(`setModelEffort: could not set ${problems.join('; ')} — session continues on account defaults`);
+  }
 }
 
 async function archiveSession(sessionId) {

@@ -45,9 +45,37 @@ echo "→ Installing npm dependencies..."
 chmod +x "$HOST_DIR/daemon.js"
 chmod +x "$HOST_DIR/native-host.js"
 
-# ── 3. Get extension ID from user ─────────────────────────────────────────────
+# ── 3. Determine the extension ID ─────────────────────────────────────────────
+# extension/manifest.json carries a "key", so the extension ID is FIXED and
+# derivable — it is the SHA-256 of the decoded key, first 16 bytes, hex mapped
+# 0-f → a-p. Chrome uses that same ID whether the extension is loaded unpacked
+# or installed from the signed .crx.
+#
+# This used to prompt unconditionally, which quietly broke every install done
+# before the key was added (2026-08-08): the manifest kept allowing the old
+# pre-key dev ID, Chrome refused the native-messaging connection, and the bridge
+# reported "Chrome not connected" forever with no hint as to why. Derive it, and
+# only fall back to asking.
+derive_extension_id() {
+  python3 - "$SCRIPT_DIR/extension/manifest.json" <<'PY' 2>/dev/null
+import base64, hashlib, json, sys
+key = json.load(open(sys.argv[1])).get("key")
+if not key:
+    raise SystemExit(1)
+digest = hashlib.sha256(base64.b64decode(key)).hexdigest()[:32]
+print("".join(chr(ord("a") + int(c, 16)) for c in digest))
+PY
+}
+
 if [ -z "$EXTENSION_ID" ]; then
+  EXTENSION_ID="$(derive_extension_id || true)"
+fi
+
+if [ -n "$EXTENSION_ID" ]; then
+  echo "→ Extension ID: $EXTENSION_ID"
+else
   echo ""
+  echo "Could not derive the extension ID from extension/manifest.json (no \"key\"?)."
   echo "Load the extension in Chrome (chrome://extensions → Load unpacked → select extension/)"
   echo "then paste your extension ID here:"
   read -r EXTENSION_ID
