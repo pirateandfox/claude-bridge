@@ -614,30 +614,70 @@ async function selectRepo(repo) {
   trigger.click();
   await pollUntil(() => document.querySelectorAll(SEL.repoOption).length > 0, 3000);
 
+  // Count the UNFILTERED list first. Typing can collapse it to zero, and a
+  // post-filter count of 0 says nothing about whether the repo is reachable —
+  // conflating those two is what made the first version of this error message
+  // blame account access for what was really a filter miss.
+  const optionCount = () => document.querySelectorAll(SEL.repoOption).length;
+  const unfiltered  = optionCount();
+
   const matches = o => {
     const t = norm(o.textContent);
     return t === repo || t === bare || t.endsWith(`/${bare}`);
   };
+  const findMatch = () => {
+    const opts = [...document.querySelectorAll(SEL.repoOption)];
+    return opts.find(o => norm(o.textContent) === repo)
+        || opts.find(o => norm(o.textContent) === bare)
+        || opts.find(o => norm(o.textContent).toLowerCase() === repo.toLowerCase())
+        || opts.find(o => norm(o.textContent).endsWith(`/${bare}`));
+  };
 
   // Best-effort type-to-filter (the list is long and may virtualize on other
   // accounts). Harmless when all options are already in the DOM.
-  const search = document.querySelector(SEL.repoSearch) || document.querySelector('input[type="text"]');
-  if (search) {
+  const pop    = document.querySelector('[role="dialog"]');
+  const search = pop?.querySelector(SEL.repoSearch) || pop?.querySelector('input')
+              || document.querySelector(SEL.repoSearch) || document.querySelector('input[type="text"]');
+  const setSearch = (v) => {
+    if (!search) return;
     const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-    setter.call(search, bare);
+    setter.call(search, v);
     search.dispatchEvent(new Event('input', { bubbles: true }));
-    await pollUntil(
-      () => [...document.querySelectorAll(SEL.repoOption)].some(matches),
-      2000,
+  };
+
+  setSearch(bare);
+  if (search) await pollUntil(() => [...document.querySelectorAll(SEL.repoOption)].some(matches), 2000);
+
+  let match = findMatch();
+
+  // The filter is fuzzy and can exclude everything — including the repo we
+  // want. Before concluding it is absent, clear the box and scan the full list.
+  if (!match && search) {
+    setSearch('');
+    await pollUntil(() => optionCount() > 0, 2000);
+    match = findMatch();
+  }
+  if (!match) {
+    // "Not found in picker" is ambiguous: it fires both when the repo is not
+    // connected to the Claude GitHub app for this account AND when our
+    // selectors miss. On 2026-06-19 a Moceanic pipeline run spent hours, a
+    // Linear escalation and a human ask on that ambiguity. Report what was
+    // actually observed so the next reader can tell the two apart immediately.
+    const seen   = [...document.querySelectorAll(SEL.repoOption)].map(o => norm(o.textContent)).filter(Boolean);
+    const sample = seen.slice(0, 8).join(' | ') + (seen.length > 8 ? ' | …' : '');
+    throw new Error(
+      `Repo "${repo}" not found in picker — typed "${bare}"; ` +
+      `search input ${search ? 'found' : 'NOT FOUND'}; ` +
+      `${unfiltered} option(s) before filtering, ${seen.length} after` +
+      (seen.length ? `: ${sample}` : '') + '. ' +
+      (unfiltered === 0
+        ? 'The picker rendered nothing at all — either SEL.repoOption no longer ' +
+          'matches, or this account has no repos connected to the Claude GitHub app.'
+        : 'The picker DID render repos, so this account can reach the list — the ' +
+          'requested repo is genuinely not among them (not connected to the Claude ' +
+          'GitHub app for this account), or its label differs from "owner/name".')
     );
   }
-
-  const options = [...document.querySelectorAll(SEL.repoOption)];
-  const match   = options.find(o => norm(o.textContent) === repo)
-               || options.find(o => norm(o.textContent) === bare)
-               || options.find(o => norm(o.textContent).toLowerCase() === repo.toLowerCase())
-               || options.find(o => norm(o.textContent).endsWith(`/${bare}`));
-  if (!match) throw new Error(`Repo "${repo}" not found in picker`);
 
   match.click();
   // Wait for the picker to close (combobox collapses) before continuing.
