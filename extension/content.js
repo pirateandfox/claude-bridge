@@ -6,9 +6,9 @@ const SEL = {
   rowMainBtn:    '[data-row-main-button]',
   rowAction:     '[data-row-action]',
   branchBar:     '.epitaxy-branch-row',
-  branchFlow:    '.epitaxy-branch-flow',
   diffSrOnly:    '.sr-only',
-  ciDot:         '.bg-extended-green, .bg-extended-red, .bg-extended-yellow',
+  ciBtn:         'button[aria-label^="CI:"]',   // e.g. "CI: all checks passed" — semantic, survives theming
+  ciDot:         '.bg-extended-green, .bg-extended-red, .bg-extended-yellow',   // legacy colour fallback
   chatInput:     'div[contenteditable="true"][aria-label="Prompt"]',
   sendBtn:       'button[aria-label="Send"]',
   usageBtn:      '[aria-label^="Usage:"]',
@@ -327,17 +327,32 @@ function readBranchBar() {
     prState = statusLabel || 'open';
   }
 
-  // Branch flow renders as [base/repo] → [feature branch]. The feature (working)
-  // branch is the button inside .epitaxy-branch-flow (it carries the .truncate);
-  // the base/repo is the branch button that precedes the flow. (The flow used to
-  // hold both buttons — base at [0], feature at [1] — but now holds only the
-  // feature, with the base hoisted out as a sibling. Read both off the full
-  // button list, excluding the PR button which is the only one with aria-label.)
-  const flowBtn       = bar.querySelector(`${SEL.branchFlow} button`);
-  const featureBranch = (flowBtn?.querySelector('.truncate')?.textContent ?? flowBtn?.textContent ?? '').trim() || null;
-  const branchBtns    = [...bar.querySelectorAll('button')].filter(b => !b.getAttribute('aria-label'));
-  const baseBtn       = branchBtns.find(b => b !== flowBtn);
-  const baseBranch    = (baseBtn?.querySelector('.truncate')?.textContent ?? baseBtn?.textContent ?? '').trim() || null;
+  // The row holds [PR icon] [#N link] [repo chip] [feature branch], then diff
+  // stats, CI and Dismiss. There is NO base branch here — the previous code
+  // returned the first unlabelled button as `baseBranch`, which is the REPO
+  // chip, so every reader got e.g. "flightdesk" where it expected "develop".
+  // `baseBranch` is therefore gone rather than nulled: nothing consumed it
+  // (FlightDesk resolves base from pr.baseRef ?? project.defaultBranch), and a
+  // permanently-null field only invites someone to build on it. If it is ever
+  // needed, hovering the repo chip renders a tooltip carrying
+  // "owner/repo:baseBranch" — at the cost of a forced hover on every read.
+  //
+  // featureBranch must come from aria-label: the visible label is split across
+  // sibling spans for wrapping ("claude/execute-pir-259-follow-" + "ups-npi60v")
+  // and reading .truncate returns only the first fragment — that is the
+  // 2026-08-08 "claude/bridge-smoke-t" truncation bug. aria-label carries the
+  // whole branch name.
+  const btns    = [...bar.querySelectorAll('button')];
+  const isMeta  = b => {
+    const al = b.getAttribute('aria-label') || '';
+    return /^CI:/i.test(al) || al === 'Dismiss';
+  };
+  const branchBtn     = btns.find(b => b.getAttribute('aria-label') && !isMeta(b));
+  const featureBranch = (branchBtn?.getAttribute('aria-label') ?? branchBtn?.textContent ?? '').trim() || null;
+
+  // Repo chip: the unlabelled menu button (the diff-stats button has no popup).
+  const repoBtn = btns.find(b => !b.getAttribute('aria-label') && b.getAttribute('aria-haspopup') === 'menu');
+  const repo    = (repoBtn?.textContent ?? '').trim() || null;
 
   // Diff stats
   const diffText  = bar.querySelector(SEL.diffSrOnly)?.textContent ?? '';
@@ -345,15 +360,23 @@ function readBranchBar() {
   const additions = diffMatch ? +diffMatch[1] : 0;
   const deletions = diffMatch ? +diffMatch[2] : 0;
 
-  // CI status from colored dot
-  const ciDot  = bar.querySelector(SEL.ciDot);
-  const ciState = ciDot
-    ? (ciDot.classList.contains('bg-extended-green')  ? 'passing'
-    :  ciDot.classList.contains('bg-extended-red')    ? 'failing'
-    :                                                    'pending')
-    : null;
+  // CI status. Prefer the button's aria-label ("CI: all checks passed") over the
+  // dot's colour class — a theme or palette rename silently breaks the colour
+  // read, and a wrong CI verdict is worse than none. Dot kept as a fallback.
+  const ciBtn   = bar.querySelector(SEL.ciBtn);
+  const ciLabel = (ciBtn?.getAttribute('aria-label') ?? '').toLowerCase();
+  const ciDot   = bar.querySelector(SEL.ciDot);
+  const ciState =
+      /pass|success/.test(ciLabel)                       ? 'passing'
+    : /fail|error/.test(ciLabel)                         ? 'failing'
+    : /running|pending|progress|queue/.test(ciLabel)     ? 'pending'
+    : ciDot
+      ? (ciDot.classList.contains('bg-extended-green') ? 'passing'
+      :  ciDot.classList.contains('bg-extended-red')   ? 'failing'
+      :                                                  'pending')
+      : null;
 
-  return { prState, prNumber, prUrl, baseBranch, featureBranch, additions, deletions, ciState };
+  return { prState, prNumber, prUrl, repo, featureBranch, additions, deletions, ciState };
 }
 
 function readModelEffortUsage() {
@@ -437,7 +460,7 @@ function readBranchBarFresh(sessionId, prevSig, navigated) {
 // sessions on similarly-named (or UI-truncated) branches still read as distinct.
 function branchBarSig(bb) {
   if (!bb) return null;
-  return [bb.featureBranch, bb.baseBranch, bb.prNumber, bb.additions, bb.deletions].join('|');
+  return [bb.featureBranch, bb.repo, bb.prNumber, bb.additions, bb.deletions].join('|');
 }
 
 function findSendButton() {
@@ -981,9 +1004,16 @@ async function setCiOptions(sessionId, { autofix, automerge }) {
   // gets flipped on someone else's session.
   assertParkedOn(sessionId, 'set_ci_options');
 
-  const ciDot = document.querySelector(SEL.ciDot);
-  const ciBtn = ciDot?.closest('button');
-  if (!ciBtn) throw new Error('CI button not found');
+  // Prefer the semantic label over the colour dot (see readBranchBar). Note the
+  // button only exists once checks have actually run — "not found" on a PR with
+  // no CI is a correct answer, not a selector failure, so say so.
+  const ciBtn = document.querySelector(SEL.ciBtn) || document.querySelector(SEL.ciDot)?.closest('button');
+  if (!ciBtn) {
+    throw new Error(
+      'CI button not found — this session\'s PR has no CI checks yet, or the ' +
+      'branch row is not rendered. Nothing to toggle.'
+    );
+  }
 
   ciBtn.click();
   await sleep(200);
