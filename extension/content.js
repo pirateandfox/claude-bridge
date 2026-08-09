@@ -730,13 +730,24 @@ function controlLabels(el) {
   return out;
 }
 
-function findNewSessionButton() {
-  // \b keeps "New" from matching "Newsletter" while tolerating the shortcut.
-  const cands = [
-    ...document.querySelectorAll(SEL.rowMainBtn),
-    ...document.querySelectorAll('button, a, [role="button"]'),
-  ];
-  return cands.find(el => controlLabels(el).some(n => /^new(\s+session)?\b/i.test(n))) || null;
+// Route to the blank code composer.
+//
+// Deliberately NOT by clicking "New". /code has no such control — it only
+// renders on a session page — and the single "New"-labelled control that does
+// appear there starts a general CHAT, routing to /new, which has no code
+// composer at all. Clicking it created the wrong kind of session entirely
+// (2026-08-08). /code IS the blank composer, so route to it via the sidebar's
+// "Code" tab, using the same client-side navigation as navigateToSession (a
+// location assignment would tear down this content script mid-operation).
+async function goToBlankComposer() {
+  // Scope to the sidebar's own pills (.df-pill, e.g. Home/Code) rather than any
+  // element whose text starts with "Code".
+  const tab = [...document.querySelectorAll('.df-pill')]
+    .find(el => controlLabels(el).some(n => /^code\b/i.test(n)));
+  if (!tab) return false;
+
+  tab.click();
+  return pollUntil(() => location.pathname.startsWith('/code') && !sessionIdFromUrl(), 5000);
 }
 
 // Each chip is paired with a hidden input `<button-id>-hidden-input` holding its
@@ -752,15 +763,25 @@ function chipValue(btn) {
 }
 
 function repoTriggerEl() {
-  const combos = [...document.querySelectorAll(SEL.repoTrigger)]
-    .filter(b => !b.matches(SEL.addRepoBtn));
+  const all   = [...document.querySelectorAll(SEL.repoTrigger)];
+  const chips = all.filter(b => !b.matches(SEL.addRepoBtn));
   const isRepoChip = b => {
     const v = chipValue(b);
     return !!(v && typeof v === 'object' && v.name && v.owner?.login);
   };
-  // Fall back to the first non-"+" chip for a session with no repo chosen yet,
-  // where there is no JSON value to match on.
-  return combos.find(isRepoChip) ?? combos[0] ?? null;
+
+  const chip = chips.find(isRepoChip) ?? chips[0];
+  if (chip) return chip;
+
+  // Nothing attached yet: the "+ Select repo…" control IS the repo selector,
+  // and its picker lists every repo. Only once a repo is attached does that
+  // same button become "add ANOTHER repo" and start EXCLUDING the attached one
+  // — which is why it must not be used for selection in that state. Excluding
+  // it unconditionally left a fresh composer with no trigger at all, so
+  // selectRepo never ran, no repo was chosen, and submitting did nothing:
+  // the prompt just sat there and create returned a null session id
+  // (2026-08-08). A newly provisioned box hits exactly this path.
+  return all.find(b => b.matches(SEL.addRepoBtn)) ?? null;
 }
 
 // Exact "owner/name" of the currently selected repo, or null if none.
@@ -790,6 +811,18 @@ async function createSession({ model, effort, prompt, repo } = {}) {
     newBtn.click();
     // Wait for the blank composer to render (URL drops the previous session id).
     await pollUntil(onBlankComposer, 5000);
+
+    // Guard the SURFACE, not just the composer. A widened "New" matcher once
+    // clicked the general-chat control and landed on claude.ai/new, which has
+    // no code composer and no model/effort chips (2026-08-08). Silently
+    // starting a chat when a code session was requested is worse than failing.
+    if (!location.pathname.startsWith('/code')) {
+      throw new Error(
+        `Landed on ${location.pathname} instead of /code — the "New" control that was ` +
+        'clicked starts a general chat, not a code session. Aborting rather than ' +
+        'creating the wrong kind of session.'
+      );
+    }
   }
 
   // A repo is now mandatory when the picker is present.
@@ -798,7 +831,13 @@ async function createSession({ model, effort, prompt, repo } = {}) {
     await selectRepo(repo);
   }
 
-  if (model || effort) await setModelEffort(model, effort);
+  if (model || effort) {
+    await setModelEffort(model, effort);
+    // Both pickers are overlays. Injecting while one is still mounted lets it
+    // swallow the Enter that submits — the prompt then sits in the composer and
+    // no session is ever created (2026-08-08). Wait for them to unmount.
+    await pollUntil(() => !document.querySelector('[role="dialog"], [role="menu"]'), 2000);
+  }
 
   await injectPrompt(prompt);          // submitting is what actually creates the session
 
@@ -821,48 +860,129 @@ async function setModelEffort(model, effort) {
   // keyboard shortcut, so reading textContent directly yields "Opus 51".
   const labelOf = el => (el.querySelector('.flex-1')?.textContent ?? el.textContent ?? '').trim();
 
+  const ITEM_SEL = '[role="menuitemradio"], [role="menuitem"], [role="option"], [role="radio"]';
+
   const chooseFrom = async (btn, want) => {
-    if (!btn) return { ok: false, seen: [] };
+    if (!btn) return { ok: false, seen: [], found: false, opened: false };
+
     btn.click();
-    await sleep(250);
-    const items = [...document.querySelectorAll('[role="menuitemradio"], [role="menuitem"]')];
+    const opened = await pollUntil(() => btn.getAttribute('aria-expanded') === 'true', 1500);
+
+    // Scope to the popup THIS trigger owns. Querying the document instead read
+    // the model menu's items while setting effort, because the model popup had
+    // not unmounted yet — reported as effort being "offered: Fable 5, Opus 5,
+    // …" (2026-08-08). aria-controls names the popup; fall back to the document
+    // only if the pattern ever changes.
+    const popupId = btn.getAttribute('aria-controls');
+    const root    = (popupId && document.getElementById(popupId)) || document;
+
+    // Model opens a menu (menuitemradio). Effort opens aria-haspopup="dialog",
+    // whose contents need not carry menu/option roles at all — so fall back to
+    // any button inside the popup rather than reporting an empty list.
+    let items = [...root.querySelectorAll(ITEM_SEL)];
+    if (!items.length) items = [...root.querySelectorAll('button')];
+
     const seen  = items.map(labelOf).filter(Boolean);
     const match = items.find(i => labelOf(i) === want)
-               || items.find(i => labelOf(i).toLowerCase() === want.toLowerCase());
+               || items.find(i => labelOf(i).toLowerCase() === want.toLowerCase())
+               || items.find(i => new RegExp(`^${want}\\b`, 'i').test(labelOf(i)));
     if (match) match.click();
     await sleep(100);
+
+    // Wait for it to actually close before the next chip is touched, rather
+    // than assuming a fixed delay is enough.
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-    await sleep(150);
-    return { ok: !!match, seen };
+    await pollUntil(() => btn.getAttribute('aria-expanded') !== 'true', 1500);
+
+    return { ok: !!match, seen, found: true, opened };
   };
 
-  // Word-boundary prefixes, not equality: these chips carry shortcut hints too,
-  // so /^High$/ never matched (same trap as "New⇧⌘O").
+  // Anchor on effort, not model. The effort chip renders "Effort: High", so
+  // /^effort\b/ identifies it uniquely; matching the level alone (/^max/) hit
+  // the ACCOUNT button ("Justin · Max") instead, because that sits earlier in
+  // the document and find() takes the first match — which opened the account
+  // menu, one stray label match from "Log out" (observed 2026-08-08).
+  //
+  // Both chips live in the same composer control row, so once effort is found
+  // the model chip is simply its sibling. No document-wide search for a model
+  // name, and no reliance on offsetParent (a fixed-position footer reports null
+  // even while plainly visible).
+  const EFFORT_RE = /^effort\b/i;
   const MODEL_RE  = /\b(opus|sonnet|haiku|fable)\b/i;
-  const EFFORT_RE = /^(low|medium|high|max)\b/i;
-  const findIn    = (root, re) => [...root.querySelectorAll('button')]
-    .filter(b => b.offsetParent)
-    .find(b => controlLabels(b).some(n => re.test(n))) || null;
+  const byLabel   = (root, re) =>
+    [...root.querySelectorAll('button')].find(b => controlLabels(b).some(n => re.test(n))) || null;
 
-  // The chips mount a beat after the composer, so wait rather than read once.
-  await pollUntil(() => findIn(document, MODEL_RE), 4000);
-  const modelBtn = findIn(document, MODEL_RE);
+  // The control row mounts a beat after the composer does.
+  await pollUntil(() => byLabel(document, EFFORT_RE), 5000);
+  const effortBtn = byLabel(document, EFFORT_RE);
+  const modelBtn  = effortBtn ? byLabel(effortBtn.parentElement ?? document, MODEL_RE) : null;
 
-  // Effort is resolved ONLY within the model chip's own control row. Searching
-  // the whole document for /^max/ matched the account button ("Justin · Max")
-  // and opened the account menu — one stray label match away from "Log out"
-  // (observed 2026-08-08). No model chip means no known-good row, so leave
-  // effort alone entirely rather than guess at which button it is.
-  const effortBtn = modelBtn ? findIn(modelBtn.parentElement ?? document, EFFORT_RE) : null;
+  // Distinguish the failure modes. Collapsing them into one "trigger not found"
+  // string sent this debugging down the wrong path twice (2026-08-08): once the
+  // trigger really was missing, once the popup opened but held no items I
+  // recognised — and the message read identically.
+  const why = r =>
+      !r.found       ? 'trigger not found'
+    : !r.opened      ? 'trigger clicked but popup never opened'
+    : r.seen.length  ? `offered: ${r.seen.join(', ')}`
+    :                  'popup opened but contained nothing selectable';
+
+  // Effort is a SLIDER, not a menu. Its popup contains
+  //   <input type="range" aria-label="Effort" min=0 max=5 aria-valuetext="High">
+  // so there is nothing to click — which is why every role-based item query came
+  // back empty and this looked like a selector break for hours. Set the range
+  // value through the native setter (React-controlled, same treatment as the
+  // repo search box) and confirm via aria-valuetext. The level NAMES are not
+  // derivable from the numbers, so sweep the range and read them back; that also
+  // makes the failure message list the levels this account actually offers.
+  const setEffort = async (btn, want) => {
+    if (!btn) return { ok: false, reason: 'trigger not found' };
+
+    const SLIDER = 'input[type="range"][aria-label="Effort"]';
+    btn.click();
+    const opened = await pollUntil(() => document.querySelector(SLIDER), 1500);
+    const input  = document.querySelector(SLIDER);
+    if (!input) {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      return { ok: false, reason: opened ? 'popup opened but no effort slider found' : 'popup never opened' };
+    }
+
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+    const apply  = v => {
+      setter.call(input, String(v));
+      input.dispatchEvent(new Event('input',  { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    };
+
+    const original = input.value;
+    const min = Number(input.min || 0);
+    const max = Number(input.max || 5);
+    const seen = [];
+    let ok = false;
+
+    for (let v = min; v <= max; v++) {
+      apply(v);
+      await sleep(60);
+      const text = (input.getAttribute('aria-valuetext') || '').trim();
+      if (text) seen.push(text);
+      if (text.toLowerCase() === String(want).toLowerCase()) { ok = true; break; }
+    }
+    if (!ok) apply(original);   // leave the slider exactly as we found it
+
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await pollUntil(() => btn.getAttribute('aria-expanded') !== 'true', 1500);
+
+    return ok ? { ok: true } : { ok: false, reason: `offered: ${[...new Set(seen)].join(', ') || 'none'}` };
+  };
 
   const problems = [];
   if (model) {
     const r = await chooseFrom(modelBtn, model);
-    if (!r.ok) problems.push(`model "${model}" (offered: ${r.seen.join(', ') || 'none — trigger not found'})`);
+    if (!r.ok) problems.push(`model "${model}" (${why(r)})`);
   }
   if (effort) {
-    const r = await chooseFrom(effortBtn, effort);
-    if (!r.ok) problems.push(`effort "${effort}" (offered: ${r.seen.join(', ') || 'none — trigger not found'})`);
+    const r = await setEffort(effortBtn, effort);
+    if (!r.ok) problems.push(`effort "${effort}" (${r.reason})`);
   }
   if (problems.length) {
     relayLog(`setModelEffort: could not set ${problems.join('; ')} — session continues on account defaults`);

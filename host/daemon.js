@@ -23,7 +23,13 @@ const MAX_QUEUE = 5;
 let   inflightRequest = null;
 const queue           = [];
 
-const TIMEOUTS = { inject: 60_000, get_state: 60_000, warm_sessions: 120_000, create_session: 60_000 };
+// create_session is the long pole: from a fresh composer with no repo attached
+// it navigates, opens a repo picker listing every repo on the account, sets
+// model and effort, submits, then waits for the new session id to land in the
+// URL. That legitimately exceeded 60s on 2026-08-08 — the session was created
+// correctly but the caller got a timeout error, which is the worst outcome:
+// a retry would create a SECOND session for the same task.
+const TIMEOUTS = { inject: 60_000, get_state: 60_000, warm_sessions: 120_000, create_session: 150_000 };
 
 function sendToChrome(cmd, params = {}) {
   return new Promise((resolve, reject) => {
