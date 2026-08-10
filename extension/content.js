@@ -879,22 +879,32 @@ async function createSession({ model, effort, prompt, repo } = {}) {
   if (!onBlankComposer()) {
     // Two independent ways onto the composer, because the shared tab can be
     // parked anywhere — most often on a session page it has sat on for days.
-    // Route via the "Code" tab first (it cannot land on the wrong surface),
-    // then click "New", which is present on a session page too.
-    let arrived = await goToBlankComposer();
-    relayLog(`create_session: "Code" tab route → ${arrived ? 'blank composer' : 'failed'} (${location.pathname})`);
+    //
+    // "New" first, because it is the only one observed to work from a session
+    // page (2026-08-10): the "Code" pill is already the active tab there, so
+    // clicking it does nothing and the wait burns its full timeout before
+    // falling through. The pill stays as the fallback for the case "New" is
+    // ever missing. Landing on the wrong surface is caught below and by
+    // assertOnBlankComposer, so ordering is a speed question, not a safety one.
+    let arrived = false;
+    const newBtn = findNewSessionButton();
 
-    if (!arrived) {
-      const newBtn = findNewSessionButton();
-      if (!newBtn) {
-        throw new Error(
-          `Could not reach the blank composer from ${location.pathname} — neither the ` +
-          'sidebar "Code" tab nor a "New" control was found; claude.ai UI may have changed'
-        );
-      }
+    if (newBtn) {
       newBtn.click();
       arrived = await awaitBlankComposer(8000);
       relayLog(`create_session: "New" click → ${arrived ? 'blank composer' : 'failed'} (${location.pathname})`);
+    }
+
+    if (!arrived) {
+      arrived = await goToBlankComposer();
+      relayLog(`create_session: "Code" tab route → ${arrived ? 'blank composer' : 'failed'} (${location.pathname})`);
+    }
+
+    if (!arrived && !newBtn) {
+      throw new Error(
+        `Could not reach the blank composer from ${location.pathname} — neither the ` +
+        'sidebar "Code" tab nor a "New" control was found; claude.ai UI may have changed'
+      );
     }
 
     // Never fall through from a page we did not reach. Without this, a failed
