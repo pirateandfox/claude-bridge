@@ -616,6 +616,14 @@ async function injectPrompt(text, { sessionId } = {}) {
 // without one — clicking "New session" opens a composer with an empty
 // "Select repo…" combobox, and submitting a prompt with no repo is a no-op.
 async function selectRepo(repo) {
+  // Defence in depth. On a session page the same-looking control is not a
+  // picker at all — it means "clone this repo into THIS session", and using it
+  // posts a user turn ("Clone the repository owner/name into this session.")
+  // into live work. That happened on 2026-08-10 because the caller's guard
+  // trusted a URL that had already updated while the session's DOM was still
+  // mounted. Never open this control without proving the surface first.
+  assertOnBlankComposer('selectRepo');
+
   const trigger = repoTriggerEl();
   if (!trigger) throw new Error('Repo picker not found — claude.ai UI may have changed');
 
@@ -751,6 +759,50 @@ function findNewSessionButton() {
   return candidates.find(b => b.querySelector('.df-new-circle')) ?? candidates[0] ?? null;
 }
 
+// Proof that the page is the BLANK composer — every mutating step in
+// createSession must be gated on this, not on the URL.
+//
+// The URL alone is a liar during a route transition: claude.ai is an SPA, so
+// location updates BEFORE React swaps the DOM, and the outgoing session's
+// panel lingers for a few frames (the same lag readBranchBarFresh exists to
+// defend against). Trusting `!sessionIdFromUrl() && chatInput` let the repo
+// step run against a still-mounted SESSION page on 2026-08-10 — where the repo
+// control is not a composer chip but "clone this repo into the session", which
+// posted a stray turn into a live session. Three independent signals must all
+// agree, so a half-swapped DOM cannot pass:
+//
+//   url        — no /code/session_… id
+//   focus      — no sidebar row is focused (a session page focuses its own row;
+//                the blank composer focuses none)
+//   branch bar — the session detail panel's bar is unmounted, not merely stale
+//
+function onBlankComposer() {
+  return !sessionIdFromUrl()
+      && !activeSessionId()
+      && !document.querySelector(SEL.branchBar)
+      && !!document.querySelector(SEL.chatInput);
+}
+
+// Wait for onBlankComposer() to hold, then hold STILL — a transition can
+// satisfy any single check mid-flight, so require it to survive a settle delay.
+async function awaitBlankComposer(maxMs) {
+  if (!await pollUntil(onBlankComposer, maxMs)) return false;
+  await new Promise(r => setTimeout(r, 400));
+  return onBlankComposer();
+}
+
+// Throw unless we are still on the blank composer. Called before EVERY step
+// that can mutate claude.ai state, because each one behaves differently — and
+// destructively — on a session page.
+function assertOnBlankComposer(what) {
+  if (onBlankComposer()) return;
+  throw new Error(
+    `${what} aborted — not on a blank composer (path=${location.pathname}, ` +
+    `focusedRow=${activeSessionId() ?? 'none'}, branchBar=${!!document.querySelector(SEL.branchBar)}). ` +
+    'Refusing to act on an existing session.'
+  );
+}
+
 // Route to the blank code composer via the sidebar's "Code" tab, using the same
 // client-side navigation as navigateToSession (a location assignment would tear
 // down this content script mid-operation). /code IS the blank composer.
@@ -765,7 +817,7 @@ async function goToBlankComposer() {
   if (!tab) return false;
 
   tab.click();
-  return pollUntil(() => location.pathname.startsWith('/code') && !sessionIdFromUrl(), 5000);
+  return awaitBlankComposer(8000);
 }
 
 // Each chip is paired with a hidden input `<button-id>-hidden-input` holding its
@@ -817,18 +869,17 @@ function selectedRepoFullName() {
 async function createSession({ model, effort, prompt, repo } = {}) {
   if (!prompt) throw new Error('A prompt is required to create a session');
 
-  // /code already mounts a blank composer, so clicking "New" is often
-  // unnecessary — but only skip it when the URL carries no session id. A
-  // composer with an id in the URL belongs to an EXISTING session, and
-  // submitting there would post into that session instead of creating one.
-  const onBlankComposer = () => !sessionIdFromUrl() && !!document.querySelector(SEL.chatInput);
+  relayLog(`create_session: starting on ${location.pathname} (focusedRow=${activeSessionId() ?? 'none'})`);
 
+  // /code already mounts a blank composer, so routing is often unnecessary —
+  // but skip it only when onBlankComposer() proves the page carries no session.
   if (!onBlankComposer()) {
     // Two independent ways onto the composer, because the shared tab can be
     // parked anywhere — most often on a session page it has sat on for days.
     // Route via the "Code" tab first (it cannot land on the wrong surface),
     // then click "New", which is present on a session page too.
     let arrived = await goToBlankComposer();
+    relayLog(`create_session: "Code" tab route → ${arrived ? 'blank composer' : 'failed'} (${location.pathname})`);
 
     if (!arrived) {
       const newBtn = findNewSessionButton();
@@ -839,19 +890,20 @@ async function createSession({ model, effort, prompt, repo } = {}) {
         );
       }
       newBtn.click();
-      // Wait for the blank composer to render (URL drops the previous session id).
-      arrived = await pollUntil(onBlankComposer, 5000);
+      arrived = await awaitBlankComposer(8000);
+      relayLog(`create_session: "New" click → ${arrived ? 'blank composer' : 'failed'} (${location.pathname})`);
     }
 
-    // Never fall through to injectPrompt from a page we did not reach. Without
-    // this, a failed route left the tab on the ORIGINAL session and the prompt
-    // was submitted into it — silently appending work to somebody else's
-    // session instead of creating one.
+    // Never fall through from a page we did not reach. Without this, a failed
+    // route left the tab on the ORIGINAL session and the steps below ran
+    // against it — which is not merely "wrong session", it is destructive: the
+    // repo control on a session page means "clone this repo INTO this session"
+    // and posts a user turn the moment it is used (2026-08-10).
     if (!arrived) {
       throw new Error(
         `Blank composer never rendered — still on ${location.pathname}` +
         (sessionIdFromUrl() ? ` (session ${sessionIdFromUrl()})` : '') +
-        '. Refusing to submit into an existing session.'
+        '. Refusing to touch an existing session.'
       );
     }
 
@@ -868,6 +920,12 @@ async function createSession({ model, effort, prompt, repo } = {}) {
     }
   }
 
+  // Re-assert before EVERY mutating step below. Reaching the composer once is
+  // not a standing guarantee: claude.ai can route the shared tab out from under
+  // an in-flight operation, and each step here does real damage on a session
+  // page — the repo control clones a repo into it, the composer submits into it.
+  assertOnBlankComposer('create_session (repo)');
+
   // A repo is now mandatory when the picker is present.
   if (repoTriggerEl()) {
     if (!repo) throw new Error('A repo is required to create a session (e.g. "owner/name")');
@@ -875,6 +933,7 @@ async function createSession({ model, effort, prompt, repo } = {}) {
   }
 
   if (model || effort) {
+    assertOnBlankComposer('create_session (model/effort)');
     await setModelEffort(model, effort);
     // Both pickers are overlays. Injecting while one is still mounted lets it
     // swallow the Enter that submits — the prompt then sits in the composer and
@@ -882,6 +941,9 @@ async function createSession({ model, effort, prompt, repo } = {}) {
     await pollUntil(() => !document.querySelector('[role="dialog"], [role="menu"]'), 2000);
   }
 
+  // The last gate, and the one that matters most: submitting is irreversible.
+  assertOnBlankComposer('create_session (submit)');
+  relayLog(`create_session: submitting on ${location.pathname}`);
   await injectPrompt(prompt);          // submitting is what actually creates the session
 
   // The new session id only exists after submit; it lands in the URL.
