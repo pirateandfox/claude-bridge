@@ -772,13 +772,16 @@ function findNewSessionButton() {
 // agree, so a half-swapped DOM cannot pass:
 //
 //   url        — no /code/session_… id
-//   focus      — no sidebar row is focused (a session page focuses its own row;
-//                the blank composer focuses none)
+//   focus      — no SESSION row is focused. Deliberately not "no row focused":
+//                the "New" control is itself a row and is focused on /code, so
+//                requiring zero focus would make this permanently false and
+//                break create everywhere. Only a real session_… key disqualifies.
 //   branch bar — the session detail panel's bar is unmounted, not merely stale
 //
 function onBlankComposer() {
+  const focused = activeSessionId();
   return !sessionIdFromUrl()
-      && !activeSessionId()
+      && !(focused && focused.startsWith('session_'))
       && !document.querySelector(SEL.branchBar)
       && !!document.querySelector(SEL.chatInput);
 }
