@@ -730,15 +730,33 @@ function controlLabels(el) {
   return out;
 }
 
-// Route to the blank code composer.
+// The sidebar's "New" control, which IS present on a session page — it sits in
+// the same slot as on /code, merely unhighlighted (confirmed against the live
+// DOM, 2026-08-10). The earlier belief that it only renders on the composer was
+// wrong, and it is why a tab parked on a session page could never create.
 //
-// Deliberately NOT by clicking "New". /code has no such control — it only
-// renders on a session page — and the single "New"-labelled control that does
-// appear there starts a general CHAT, routing to /new, which has no code
-// composer at all. Clicking it created the wrong kind of session entirely
-// (2026-08-08). /code IS the blank composer, so route to it via the sidebar's
-// "Code" tab, using the same client-side navigation as navigateToSession (a
-// location assignment would tear down this content script mid-operation).
+// It is a [data-row-main-button] like every session row, so rows must be
+// excluded, and it must be told apart from the general-chat "New" — which
+// routes to /new, a surface with no code composer at all (2026-08-08). Two
+// marks identify the code one: the .df-new-circle icon slot and the ⇧⌘O
+// shortcut. Labels are split across spans ("New⇧⌘O"), so match by prefix via
+// controlLabels rather than equality.
+function findNewSessionButton() {
+  const candidates = [...document.querySelectorAll(
+    'button[aria-keyshortcuts="Shift+Meta+O"], button[data-row-main-button]',
+  )].filter(b => !b.closest(SEL.sessionRow) && controlLabels(b).some(n => /^new\b/i.test(n)));
+
+  // Prefer the control carrying the code sidebar's own icon slot; only fall
+  // back to a bare "New" when claude.ai drops that class.
+  return candidates.find(b => b.querySelector('.df-new-circle')) ?? candidates[0] ?? null;
+}
+
+// Route to the blank code composer via the sidebar's "Code" tab, using the same
+// client-side navigation as navigateToSession (a location assignment would tear
+// down this content script mid-operation). /code IS the blank composer.
+//
+// Tried before clicking "New" because it cannot land on the wrong surface, and
+// returns false rather than throwing so the caller can fall back.
 async function goToBlankComposer() {
   // Scope to the sidebar's own pills (.df-pill, e.g. Home/Code) rather than any
   // element whose text starts with "Code".
@@ -806,11 +824,36 @@ async function createSession({ model, effort, prompt, repo } = {}) {
   const onBlankComposer = () => !sessionIdFromUrl() && !!document.querySelector(SEL.chatInput);
 
   if (!onBlankComposer()) {
-    const newBtn = findNewSessionButton();
-    if (!newBtn) throw new Error('New session control not found — claude.ai UI may have changed');
-    newBtn.click();
-    // Wait for the blank composer to render (URL drops the previous session id).
-    await pollUntil(onBlankComposer, 5000);
+    // Two independent ways onto the composer, because the shared tab can be
+    // parked anywhere — most often on a session page it has sat on for days.
+    // Route via the "Code" tab first (it cannot land on the wrong surface),
+    // then click "New", which is present on a session page too.
+    let arrived = await goToBlankComposer();
+
+    if (!arrived) {
+      const newBtn = findNewSessionButton();
+      if (!newBtn) {
+        throw new Error(
+          `Could not reach the blank composer from ${location.pathname} — neither the ` +
+          'sidebar "Code" tab nor a "New" control was found; claude.ai UI may have changed'
+        );
+      }
+      newBtn.click();
+      // Wait for the blank composer to render (URL drops the previous session id).
+      arrived = await pollUntil(onBlankComposer, 5000);
+    }
+
+    // Never fall through to injectPrompt from a page we did not reach. Without
+    // this, a failed route left the tab on the ORIGINAL session and the prompt
+    // was submitted into it — silently appending work to somebody else's
+    // session instead of creating one.
+    if (!arrived) {
+      throw new Error(
+        `Blank composer never rendered — still on ${location.pathname}` +
+        (sessionIdFromUrl() ? ` (session ${sessionIdFromUrl()})` : '') +
+        '. Refusing to submit into an existing session.'
+      );
+    }
 
     // Guard the SURFACE, not just the composer. A widened "New" matcher once
     // clicked the general-chat control and landed on claude.ai/new, which has

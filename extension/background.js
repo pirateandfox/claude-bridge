@@ -71,8 +71,19 @@ async function onDaemonMessage(msg) {
     return;
   }
 
-  // Prefer tabs on the Code sessions page, then active tab, then first
-  const codeTab = tabs.find(t => t.url?.includes('/code'));
+  // Prefer tabs on the Code sessions page, then active tab, then first.
+  //
+  // For create_session, prefer a tab already on the BLANK composer over one
+  // parked on a session page. `/code/session_…` also matches "/code", so a tab
+  // left on a session (loom had one sitting there since Aug 8) won this
+  // selection every time and create failed on that box indefinitely — always
+  // the same tab id, which reads like a race but is just a stuck tab. The
+  // content script can route itself off a session page now, but starting from
+  // the composer avoids the navigation entirely.
+  const isComposer = t => /^https:\/\/claude\.ai\/code\/?(\?|#|$)/.test(t.url ?? '');
+  const codeTab = cmd === 'create_session'
+    ? (tabs.find(isComposer) ?? tabs.find(t => t.url?.includes('/code')))
+    : tabs.find(t => t.url?.includes('/code'));
   const tab = codeTab ?? tabs.find(t => t.active) ?? tabs[0];
   // Logs which tab a command was routed to — a login/interstitial URL here
   // explains a hung command (the in-page API fetch never authenticates).
