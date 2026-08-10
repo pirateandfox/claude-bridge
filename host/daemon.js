@@ -13,6 +13,25 @@ import { SOCKET_PATH, MCP_PORT }            from './shared.js';
 // ── Chrome relay state ─────────────────────────────────────────────────────────
 let chromeSocket = null;   // single connection from native-host relay
 let extension    = null;   // {version, id, since} reported by the loaded extension
+
+// Requests whose timeout we already reported to the caller, kept just long
+// enough to recognise a late reply for what it is. Bounded — this is a
+// diagnostic, not a ledger.
+const timedOutRequests = new Map();   // requestId -> {cmd, at}
+const orphanedSuccesses = [];         // work that completed after the caller gave up
+
+function rememberTimedOut(requestId, cmd) {
+  timedOutRequests.set(requestId, { cmd, at: Date.now() });
+  // Keep only the recent ones; a reply arriving minutes later is already beyond
+  // anything the caller could correlate.
+  const cutoff = Date.now() - 15 * 60_000;
+  for (const [id, rec] of timedOutRequests) {
+    if (rec.at < cutoff) timedOutRequests.delete(id);
+  }
+  while (timedOutRequests.size > 100) {
+    timedOutRequests.delete(timedOutRequests.keys().next().value);
+  }
+}
 let chromeBuf    = '';
 const pending    = new Map(); // requestId -> { resolve, reject, timer }
 
@@ -69,12 +88,18 @@ function dispatchTask(task) {
 
   const timer = setTimeout(() => {
     log(`TIMEOUT ${task.cmd} after ${ms}ms — no Chrome response (requestId=${requestId})`);
+    // Remember what timed out. A late response is not merely uncorrelated — for
+    // a create it may report a session that now exists and that the caller was
+    // told did not. Keeping the cmd is what lets handleChromeMessage say so.
+    rememberTimedOut(requestId, task.cmd);
     finish(task.reject)(new Error(`Timed out waiting for Chrome response (${task.cmd})`));
   }, ms);
 
   pending.set(requestId, { resolve: finish(task.resolve), reject: finish(task.reject), timer });
   log(`→ dispatch ${task.cmd} (requestId=${requestId}, timeout=${ms}ms)`);
-  chromeSocket.write(JSON.stringify({ requestId, cmd: task.cmd, ...task.params }) + '\n');
+  // Tell the page how long the caller will actually wait, so it can refuse to
+  // start anything irreversible it cannot finish and report inside that window.
+  chromeSocket.write(JSON.stringify({ requestId, cmd: task.cmd, budgetMs: ms, ...task.params }) + '\n');
 }
 
 function drainQueue() {
@@ -131,7 +156,28 @@ function handleChromeMessage(msg) {
     // already settled/timed out, or the requestId got mangled in relay. Logging
     // it distinguishes "content never replied" (no orphan, just TIMEOUT) from
     // "content replied too late / uncorrelated" (orphan after TIMEOUT).
-    if (msg.requestId) log(`orphan response (requestId=${msg.requestId}, ok=${msg.ok}) — already settled or uncorrelated`);
+    if (!msg.requestId) return;
+
+    const timedOut = timedOutRequests.get(msg.requestId);
+
+    // A late SUCCESS is the dangerous orphan: the caller was told this failed,
+    // so any state it created is state nobody is tracking. The content script
+    // now refuses to submit without budget to report, which should prevent it —
+    // but if one ever gets through, it must be loud and it must be recoverable,
+    // not a debug line in a log file nobody greps.
+    if (msg.ok && timedOut) {
+      const record = { cmd: timedOut.cmd, requestId: msg.requestId, sessionId: msg.sessionId ?? null, at: new Date().toISOString() };
+      orphanedSuccesses.push(record);
+      if (orphanedSuccesses.length > 50) orphanedSuccesses.shift();
+      log(
+        `ORPHAN SUCCESS — ${timedOut.cmd} completed AFTER its timeout was reported to the caller` +
+        (msg.sessionId ? ` and created/affected ${msg.sessionId}` : '') +
+        `. The caller believes this failed; reconcile before retrying (requestId=${msg.requestId})`
+      );
+      return;
+    }
+
+    log(`orphan response (requestId=${msg.requestId}, ok=${msg.ok}) — already settled or uncorrelated`);
     return;
   }
 
@@ -420,6 +466,10 @@ app.get('/health', (_req, res) => res.json({
   extensionId:      chromeSocket ? extension?.id ?? null : null,
   inflight: inflightRequest?.cmd ?? null,
   queued: queue.length,
+  // Work that finished after its caller was told it had failed — usually a
+  // session that exists but that nothing is tracking. Non-empty means reconcile
+  // before retrying, and it is deliberately here rather than only in the log.
+  orphanedSuccesses,
 }));
 
 app.listen(MCP_PORT, '127.0.0.1', () =>

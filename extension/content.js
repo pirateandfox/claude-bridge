@@ -954,9 +954,13 @@ async function createSession({ model, effort, prompt, repo } = {}) {
     await pollUntil(() => !document.querySelector('[role="dialog"], [role="menu"]'), 2000);
   }
 
-  // The last gate, and the one that matters most: submitting is irreversible.
+  // The last gates, and the ones that matter most: submitting is irreversible.
+  // WHERE it lands is assertOnBlankComposer's job; WHETHER anyone is still
+  // listening is assertBudget's. A session created after the caller gave up is
+  // invisible to it — worse than no session at all, because the retry makes two.
   assertOnBlankComposer('create_session (submit)');
-  relayLog(`create_session: submitting on ${location.pathname}`);
+  assertBudget('create_session', SUBMIT_MARGIN_MS);
+  relayLog(`create_session: submitting on ${location.pathname} (${Math.round(budgetLeftMs() / 1000)}s budget left)`);
   await injectPrompt(prompt);          // submitting is what actually creates the session
 
   // The new session id only exists after submit; it lands in the URL.
@@ -1373,6 +1377,40 @@ function withNavLock(fn) {
 // In MV3 the service worker can lose the sendResponse channel during long async
 // ops (get_state takes 5-20s of DOM polling).  chrome.runtime.sendMessage
 // reliably wakes the worker even if it was terminated mid-operation.
+// ── Caller budget ──────────────────────────────────────────────────────────────
+//
+// The daemon gives up on a command after TIMEOUTS[cmd] and reports failure —
+// but nothing tells the content script to stop, so in-page work carries on and
+// can still perform an irreversible act AFTER the caller has been told it
+// failed. On 2026-08-10 a create that timed out at 150s went on to submit at
+// +220s, creating a session the caller believed had never been created. Any
+// fleet logic that retries on timeout therefore double-creates, and the daemon
+// cannot see it happen.
+//
+// The fix is not cancellation (an awaiting content script cannot be interrupted
+// mid-step) but a deadline: never START something irreversible that cannot also
+// be REPORTED inside the caller's budget. Better to fail having done nothing
+// than to succeed unobservably.
+const RELAY_SLACK_MS  = 2_000;    // daemon's clock started before ours; give it back
+const SUBMIT_MARGIN_MS = 20_000;  // submit → id in URL → respond measured ~5s; 4× that
+
+let cmdDeadline = Infinity;       // safe default: no budget declared → no gate
+
+function budgetLeftMs() {
+  return cmdDeadline - Date.now();
+}
+
+// Refuse to proceed unless `needMs` of the caller's budget remains.
+function assertBudget(what, needMs) {
+  const left = budgetLeftMs();
+  if (left >= needMs) return;
+  throw new Error(
+    `${what} aborted before submitting — ${Math.max(0, Math.round(left / 1000))}s of the ` +
+    `caller's budget remains, ${Math.round(needMs / 1000)}s needed to submit and report. ` +
+    'Nothing was submitted; retrying is safe.'
+  );
+}
+
 function respond(requestId, data) {
   chrome.runtime.sendMessage({ type: 'cmd_response', requestId, ...data }).catch(() => {});
 }
@@ -1380,6 +1418,14 @@ function respond(requestId, data) {
 // ── Message handler ────────────────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg) => {
   const { requestId } = msg;
+
+  // Adopt the daemon's own timeout as this command's deadline. Its clock
+  // started at dispatch, before the message reached us, so hand back slack
+  // rather than racing it. Commands arrive one at a time (the daemon keeps a
+  // single request in flight), so one module-level deadline is sufficient.
+  cmdDeadline = typeof msg.budgetMs === 'number'
+    ? Date.now() + msg.budgetMs - RELAY_SLACK_MS
+    : Infinity;
 
   (async () => {
     try {
@@ -1525,6 +1571,12 @@ chrome.runtime.onMessage.addListener((msg) => {
                 await sleep(400);
               }
             }
+
+            // Same hazard as create, same remedy: a prompt submitted after the
+            // daemon gave up is a turn the caller does not know it posted, and
+            // its retry posts a second copy into live work. The baseline fetch
+            // above can burn real time, so re-check here rather than on entry.
+            assertBudget('inject', SUBMIT_MARGIN_MS);
 
             await injectPrompt(msg.prompt, { sessionId: msg.sessionId });
 
