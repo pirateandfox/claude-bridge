@@ -47,6 +47,19 @@ function ensureConnected(reason = 'startup') {
   });
 
   console.log(`[claude-bridge] connected to native host (${reason})`);
+
+  // Announce what Chrome ACTUALLY loaded. A drift guard that hashes the CRX or
+  // reads the registration file is checking what was staged, not what is
+  // running, and /health's `chrome: true` proves only that a relay is
+  // connected. This is the one version reading that cannot be stale: it comes
+  // from the live service worker's own manifest, so no profile has to be
+  // guessed at (Local State last_used, Default vs Profile 1) to find it.
+  send({
+    type: 'hello',
+    extensionVersion: chrome.runtime.getManifest().version,
+    extensionId: chrome.runtime.id,
+  });
+
   flushOutbox();
 }
 

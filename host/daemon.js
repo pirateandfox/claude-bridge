@@ -12,6 +12,7 @@ import { SOCKET_PATH, MCP_PORT }            from './shared.js';
 
 // ── Chrome relay state ─────────────────────────────────────────────────────────
 let chromeSocket = null;   // single connection from native-host relay
+let extension    = null;   // {version, id, since} reported by the loaded extension
 let chromeBuf    = '';
 const pending    = new Map(); // requestId -> { resolve, reject, timer }
 
@@ -101,6 +102,16 @@ function flushAllRequests(err) {
 }
 
 function handleChromeMessage(msg) {
+  // Identity of the extension that is actually running, sent on every connect.
+  // Surfaced via /health so a fleet drift check can verify the LOADED version
+  // rather than a staged CRX or a registration file — neither of which reflects
+  // what Chrome loaded, and neither of which knows which profile is in use.
+  if (msg.type === 'hello') {
+    extension = { version: msg.extensionVersion ?? null, id: msg.extensionId ?? null, since: new Date().toISOString() };
+    log(`extension connected: v${extension.version} (${extension.id})`);
+    return;
+  }
+
   // Diagnostic line relayed from the extension (content script / background) so
   // fleet debugging needs only this one log file, not the headless browser console.
   if (msg.type === 'log') {
@@ -151,6 +162,7 @@ createNetServer((sock) => {
   sock.on('close', () => {
     log('native-host relay disconnected');
     chromeSocket = null;
+    extension    = null;   // never report a version for an extension that is gone
     flushAllRequests(new Error('Chrome disconnected'));
   });
   sock.on('error', (e) => log(`relay socket error: ${e.message}`));
@@ -402,6 +414,10 @@ app.all('/mcp', async (req, res) => {
 app.get('/health', (_req, res) => res.json({
   ok: true,
   chrome: !!chromeSocket,
+  // null when the relay is up but no extension has announced itself — which is
+  // exactly the state `chrome: true` alone cannot distinguish from a healthy one.
+  extensionVersion: chromeSocket ? extension?.version ?? null : null,
+  extensionId:      chromeSocket ? extension?.id ?? null : null,
   inflight: inflightRequest?.cmd ?? null,
   queued: queue.length,
 }));
