@@ -2,7 +2,9 @@
 // Always-running daemon: MCP Streamable-HTTP server (port 7878) + Unix socket for native-host relay
 
 import { createServer as createNetServer } from 'net';
-import { unlinkSync, existsSync }           from 'fs';
+import { unlinkSync, existsSync, readdirSync } from 'fs';
+import { homedir }                          from 'os';
+import { join }                             from 'path';
 import express                              from 'express';
 import crypto                               from 'crypto';
 import { Server }                           from '@modelcontextprotocol/sdk/server/index.js';
@@ -13,6 +15,82 @@ import { SOCKET_PATH, MCP_PORT }            from './shared.js';
 // ── Chrome relay state ─────────────────────────────────────────────────────────
 let chromeSocket = null;   // single connection from native-host relay
 let extension    = null;   // {version, id, since} reported by the loaded extension
+
+// ── Extension version skew ────────────────────────────────────────────────────
+// Chrome installs a staged CRX during startup but keeps running the extension it
+// already loaded, then removes the old version's directory. The service worker
+// survives with its own files deleted: it stays connected to this relay and keeps
+// answering, but every content-script injection fails on a missing content.js.
+// Nothing in `ok`, `chrome`, or `extensionVersion` moves during that outage —
+// the version reported IS the broken one — so the only signal that names the
+// state is the version the worker announced vs. the version Chrome has on disk.
+// Observed on forge 2026-08-11: ok:true, chrome:true, extensionVersion 0.1.3,
+// and the only 0.1.3 files left on disk were the ones Chrome had just deleted.
+//
+// This deliberately reads CHROME's installed copy, not this repo's
+// extension/manifest.json. Fleet nodes install the signed CRX through Chrome's
+// external-extension mechanism at a version PINNED BY THE FLEET PLAYBOOK, so the
+// repo checkout on a node is not the deploy source and can legitimately sit
+// ahead of or behind what is installed. Comparing against the repo would report
+// drift that is not drift. (Tried and reverted 2026-08-26.)
+//
+// A development box that loads the extension UNPACKED has no
+// Extensions/<id>/<version> directory at all, so this reads null there. That is
+// correct rather than broken: with an unpacked load the running extension IS the
+// working tree, so there is no staged-vs-running skew to detect.
+const CHROME_USER_DATA_DIR = process.env.CHROME_USER_DATA_DIR || join(homedir(), '.config', 'google-chrome');
+// The relay learns the id from the extension's hello, so this is only needed to
+// report on-disk state while nothing is connected.
+const EXTENSION_ID_HINT = process.env.CLAUDE_BRIDGE_EXTENSION_ID || null;
+
+function parseVersionDir(name) {
+  // Chrome names these "<version>_<generation>", e.g. "0.1.10_1".
+  const version = name.replace(/_\d+$/, '');
+  if (!/^\d+(\.\d+)*$/.test(version)) return null;
+  return { version, parts: version.split('.').map(Number) };
+}
+
+function compareVersionParts(a, b) {
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const diff = (a[i] ?? 0) - (b[i] ?? 0);
+    if (diff) return diff;
+  }
+  return 0;
+}
+
+// Highest version Chrome has unpacked for our extension. Returns null whenever
+// that cannot be established — unknown id, unreadable directory, non-default
+// profile, or an unpacked load. Null must read as "unknown", never as "agrees
+// with what is running": a probe that cannot see the disk is not evidence of
+// health.
+function installedExtensionVersion() {
+  const id = extension?.id ?? EXTENSION_ID_HINT;
+  if (!id) return null;
+  try {
+    const versions = readdirSync(join(CHROME_USER_DATA_DIR, 'Default', 'Extensions', id), { withFileTypes: true })
+      .filter(entry => entry.isDirectory())
+      .map(entry => parseVersionDir(entry.name))
+      .filter(Boolean)
+      .sort((a, b) => compareVersionParts(a.parts, b.parts));
+    return versions.length ? versions[versions.length - 1].version : null;
+  } catch {
+    return null;
+  }
+}
+
+// ── Relay downtime ────────────────────────────────────────────────────────────
+// `chrome: false` says the relay is down; it does NOT say for how long, and that
+// is the difference between "Chrome is restarting right now" and an outage that
+// has been sitting there for days. Downtime is the field monitoring can actually
+// alert on, so it is reported rather than left to be inferred from the log.
+// Seeded at startup: never having connected is itself an outage, not a fresh
+// start.
+let chromeDownSince = Date.now();
+let lastConnectedAt = null;
+// When the extension's keepalive last pinged. `chrome: true` only proves a
+// socket is open; a service worker can be wedged behind a healthy-looking port,
+// and a lastPingAt that stops advancing is the earliest warning of that.
+let lastPingAt = null;
 
 // Requests whose timeout we already reported to the caller, kept just long
 // enough to recognise a late reply for what it is. Bounded — this is a
@@ -137,6 +215,17 @@ function handleChromeMessage(msg) {
     return;
   }
 
+  // Liveness probe from the extension's keepalive tick. background.js cannot tell
+  // "port open and daemon answering" from "port open but wedged" — `port` stays
+  // truthy either way, and native-host.js only drops it when its own socket
+  // closes cleanly. Answering here gives the extension the one signal that
+  // distinguishes them, so it can tear a dead port down instead of trusting it.
+  if (msg.type === 'ping') {
+    lastPingAt = new Date().toISOString();
+    chromeSocket?.write(JSON.stringify({ type: 'pong' }) + '\n');
+    return;
+  }
+
   // Diagnostic line relayed from the extension (content script / background) so
   // fleet debugging needs only this one log file, not the headless browser console.
   if (msg.type === 'log') {
@@ -190,9 +279,12 @@ function handleChromeMessage(msg) {
 if (existsSync(SOCKET_PATH)) { try { unlinkSync(SOCKET_PATH); } catch {} }
 
 createNetServer((sock) => {
-  log('native-host relay connected');
-  chromeSocket = sock;
-  chromeBuf    = '';
+  const downMs = chromeDownSince ? Date.now() - chromeDownSince : 0;
+  log(`native-host relay connected (down ${Math.round(downMs / 1000)}s)`);
+  chromeSocket    = sock;
+  chromeBuf       = '';
+  chromeDownSince = null;
+  lastConnectedAt = new Date().toISOString();
 
   sock.on('data', (chunk) => {
     chromeBuf += chunk.toString();
@@ -207,8 +299,10 @@ createNetServer((sock) => {
 
   sock.on('close', () => {
     log('native-host relay disconnected');
-    chromeSocket = null;
-    extension    = null;   // never report a version for an extension that is gone
+    chromeSocket    = null;
+    extension       = null;   // never report a version for an extension that is gone
+    lastPingAt      = null;   // belongs to the connection that just died
+    chromeDownSince = Date.now();
     flushAllRequests(new Error('Chrome disconnected'));
   });
   sock.on('error', (e) => log(`relay socket error: ${e.message}`));
@@ -457,20 +551,40 @@ app.all('/mcp', async (req, res) => {
   }
 });
 
-app.get('/health', (_req, res) => res.json({
-  ok: true,
-  chrome: !!chromeSocket,
+app.get('/health', (_req, res) => {
   // null when the relay is up but no extension has announced itself — which is
   // exactly the state `chrome: true` alone cannot distinguish from a healthy one.
-  extensionVersion: chromeSocket ? extension?.version ?? null : null,
-  extensionId:      chromeSocket ? extension?.id ?? null : null,
-  inflight: inflightRequest?.cmd ?? null,
-  queued: queue.length,
-  // Work that finished after its caller was told it had failed — usually a
-  // session that exists but that nothing is tracking. Non-empty means reconcile
-  // before retrying, and it is deliberately here rather than only in the log.
-  orphanedSuccesses,
-}));
+  const running = chromeSocket ? extension?.version ?? null : null;
+  const onDisk  = installedExtensionVersion();
+  res.json({
+    ok: true,
+    chrome: !!chromeSocket,
+    extensionVersion: running,
+    extensionId:      chromeSocket ? extension?.id ?? null : null,
+    extensionVersionOnDisk: onDisk,
+    // How long the relay has been down, and when it was last up. `chrome: false`
+    // alone cannot distinguish a browser restart from a multi-day outage; this
+    // can, and it is what a fleet monitor should alert on.
+    chromeDownMs:    chromeSocket ? 0 : Date.now() - chromeDownSince,
+    lastConnectedAt,
+    lastPingAt,
+    // True only when both versions are known and disagree; null on either side
+    // leaves this false, because "cannot tell" must not be reported as a fault.
+    //
+    // `ok` deliberately stays true here. A rollout passes through this state
+    // legitimately for the seconds between Chrome installing the CRX and being
+    // restarted onto it, and the fleet waits for ok:true *before* performing that
+    // activation restart — flipping ok would deadlock the deploy that fixes it.
+    // Callers that need a verdict rather than liveness read this field.
+    extensionStale: running !== null && onDisk !== null && running !== onDisk,
+    inflight: inflightRequest?.cmd ?? null,
+    queued: queue.length,
+    // Work that finished after its caller was told it had failed — usually a
+    // session that exists but that nothing is tracking. Non-empty means reconcile
+    // before retrying, and it is deliberately here rather than only in the log.
+    orphanedSuccesses,
+  });
+});
 
 app.listen(MCP_PORT, '127.0.0.1', () =>
   log(`MCP server listening on http://127.0.0.1:${MCP_PORT}/mcp`),

@@ -1,9 +1,17 @@
 const HOST_NAME = 'com.claudebridge.host';
 const KEEPALIVE_ALARM = 'claude-bridge-keepalive';
+const RECONNECT_ALARM = 'claude-bridge-reconnect';
 const RECONNECT_DELAY_MS = 2000;
+
+// A port is only proof of a live relay if something answers on it. The keepalive
+// tick pings the daemon; if nothing has answered in more than two ticks, the port
+// is wedged rather than idle and gets torn down. Two ticks so a single missed or
+// throttled alarm cannot cause a spurious reconnect.
+const PONG_GRACE_MS = 150_000;
 
 let port = null;
 let reconnectTimer = null;
+let lastPongAt = 0;
 
 function isClaudeUrl(url) {
   return typeof url === 'string' && url.startsWith('https://claude.ai/');
@@ -18,6 +26,13 @@ function diag(msg) {
 }
 
 function scheduleReconnect(reason) {
+  // setTimeout is the fast path, but it dies with the service worker: MV3 tears
+  // the worker down while idle and the pending timer goes with it, so a
+  // disconnect that happens just before a teardown would wait for the 1-minute
+  // keepalive rather than retrying in 2s. Arm an alarm too — alarms survive
+  // teardown and wake the worker to run them.
+  chrome.alarms.create(RECONNECT_ALARM, { delayInMinutes: 0.5 });
+
   if (reconnectTimer) return;
 
   reconnectTimer = setTimeout(() => {
@@ -26,24 +41,55 @@ function scheduleReconnect(reason) {
   }, RECONNECT_DELAY_MS);
 }
 
+// Tear down a port we no longer trust. Chrome does NOT fire our own onDisconnect
+// when we call disconnect() ourselves, so `port` must be cleared here.
+function dropPort(reason) {
+  const dead = port;
+  port = null;
+  console.warn(`[claude-bridge] dropping native port: ${reason}`);
+  try { dead?.disconnect(); } catch {}
+  ensureConnected('force-reconnect');
+}
+
+// Keepalive tick: prove the relay still answers, or replace it.
+function heartbeat() {
+  if (!port) return;
+  if (lastPongAt && Date.now() - lastPongAt > PONG_GRACE_MS) {
+    dropPort(`no pong for ${Math.round((Date.now() - lastPongAt) / 1000)}s`);
+    return;
+  }
+  send({ type: 'ping' });
+}
+
 function ensureConnected(reason = 'startup') {
   if (port) return;
 
+  let opened;
   try {
-    port = chrome.runtime.connectNative(HOST_NAME);
+    opened = chrome.runtime.connectNative(HOST_NAME);
   } catch (err) {
     console.warn(`[claude-bridge] failed to connect native host (${reason}): ${err.message}`);
     scheduleReconnect('connect-error');
     return;
   }
 
-  port.onMessage.addListener(onDaemonMessage);
+  port = opened;
+  // Assume alive at connect, so a fresh port is never judged by a stale pong.
+  lastPongAt = Date.now();
+  chrome.alarms.clear(RECONNECT_ALARM);
 
-  port.onDisconnect.addListener(() => {
+  opened.onMessage.addListener(onDaemonMessage);
+
+  opened.onDisconnect.addListener(() => {
     const err = chrome.runtime.lastError?.message ?? 'unknown';
     console.warn(`[claude-bridge] native host disconnected: ${err}. Reconnecting in 2s...`);
-    port = null;
-    scheduleReconnect('disconnect');
+    // Only clear if this is still the CURRENT port. A late onDisconnect from a
+    // port we already replaced would otherwise null out its healthy successor
+    // and leave the bridge down until the next keepalive tick.
+    if (port === opened) {
+      port = null;
+      scheduleReconnect('disconnect');
+    }
   });
 
   console.log(`[claude-bridge] connected to native host (${reason})`);
@@ -75,6 +121,10 @@ function wake(reason) {
 }
 
 async function onDaemonMessage(msg) {
+  // Liveness reply — see heartbeat(). Handled before anything else so a pong can
+  // never be mistaken for a command and go looking for a tab.
+  if (msg?.type === 'pong') { lastPongAt = Date.now(); return; }
+
   const { requestId, cmd, sessionId, ...params } = msg;
 
   const tabs = await chrome.tabs.query({ url: 'https://claude.ai/*' });
@@ -175,7 +225,12 @@ chrome.runtime.onStartup.addListener(() => wake('runtime-startup'));
 chrome.runtime.onInstalled.addListener(() => wake('runtime-installed'));
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === KEEPALIVE_ALARM) wake('keepalive-alarm');
+  if (alarm.name === KEEPALIVE_ALARM) {
+    wake('keepalive-alarm');
+    heartbeat();
+  } else if (alarm.name === RECONNECT_ALARM) {
+    wake('reconnect-alarm');
+  }
 });
 
 chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
