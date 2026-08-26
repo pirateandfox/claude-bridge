@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "claude-bridge",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "description": "Exposes Claude Code cloud sessions as MCP tools",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0fLHhzTT7QjZZy+J+FpVw/mzXz3dZBbMHJTovJ2Jel9JJNcOmwB7gkYEu8e4VrrW6SbeddBFKeT9SseBVn3J2m4jP5Cmnuxp1hatGj5WrOZYfs6LprXDDKJ8NOJPLy9kTVxno2mv0Hd3kKhtQ2zh57g4VkdQDsf9/1PN2DyIhW9DEQGTJX6ompcGES/1MXMYB12aPg+HVflB5JFrovU15SOAG4CuUcC1w7mVWKnTTeriXf/rU4atzXO8mkxkP+m2odECTYpUlsiI8T72MTHHv+IHC+CvBcXAlAzJp0CyvmnJww0K12du6LF1V8MyqfU3pqe3XdSNyScsh4hxLRLR8wIDAQAB",
   "icons": {
