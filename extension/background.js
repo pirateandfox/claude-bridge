@@ -110,6 +110,22 @@ function ensureConnected(reason = 'startup') {
 }
 
 async function ensureKeepaliveAlarm() {
+  // Create only when ABSENT, and never unconditionally. chrome.alarms.create()
+  // on an existing name CANCELS AND REPLACES it, restarting the period from
+  // zero — and wake() runs from eight call sites, including the top-level
+  // statement that re-runs every time MV3 respawns the worker after its ~30s
+  // idle teardown. On a box sitting on a live claude.ai tab, tabs.onUpdated
+  // alone re-armed this to +60s far more often than once a minute, so a
+  // 1-minute alarm could never reach its period: heartbeat() never ran,
+  // lastPingAt stayed null on every node, and with it the PONG_GRACE_MS check
+  // that is the ONLY thing that tears down a wedged port. The dispatch path was
+  // self-defeating too — an alarm firing wakes the worker, whose top-level
+  // wake() then replaced the very alarm that was mid-dispatch.
+  //
+  // Reproduced 2026-08-26 by bumping a claude.ai tab's hash every 15s: pings
+  // stopped instantly and never resumed while the churn continued. It did NOT
+  // reproduce on an idle tab, which is why this survived local verification.
+  if (await chrome.alarms.get(KEEPALIVE_ALARM)) return;
   await chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 1 });
 }
 
