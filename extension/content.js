@@ -1341,7 +1341,21 @@ async function createPr(sessionId) {
   // whichever session the shared tab is still showing.
   assertParkedOn(sessionId, 'create_pr');
 
-  const btn = document.querySelector('button[aria-label="Create PR"]');
+  // Identify by TEXT, scoped to the session's own branch bar. This was
+  // `button[aria-label="Create PR"]`, but the control carries no aria-label at
+  // all (2026-08-26), so create_pr failed with "Create PR button not found" on
+  // every session that actually had one. Scoping to the branch bar also shrinks
+  // the document-global blast radius the comment above worries about, since
+  // that bar belongs to the session we just proved we are parked on.
+  const bar = document.querySelector(SEL.branchBar);
+  const scope = bar ?? document;
+  const btn = scope.querySelector('button[aria-label="Create PR"]')
+    ?? [...scope.querySelectorAll('button')]
+         .find(b => /^create pr$/i.test((b.textContent ?? '').trim()));
+
+  // No branch bar at all means the session has no diff yet — that is a correct
+  // answer about the session, not a broken selector, so do not conflate them.
+  if (!bar) throw new Error('No branch bar for this session — nothing to open a PR from (no committed changes yet?)');
   if (!btn)           throw new Error('Create PR button not found');
   if (btn.closest('[data-disabled]')) throw new Error('Create PR button is disabled');
   btn.click();
