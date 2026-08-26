@@ -382,15 +382,25 @@ function readBranchBar() {
 function readModelEffortUsage() {
   let model = null, effort = null, usagePct = null;
 
-  // Model button contains a .truncate with model name + a sibling span for effort
+  // Identify these chips by their TEXT, not by presentational classes. They were
+  // found via `.truncate` (model name) and `.text-t6` (effort); claude.ai renamed
+  // both, so model and effort came back null on every session — while usagePct,
+  // which keys off the semantic aria-label "Usage: …", kept working (2026-08-26).
+  // That asymmetry is the tell: prefer semantics, and treat a styling class as a
+  // legacy fallback only. Model and effort are now separate sibling buttons,
+  // reading "Opus 5" and "Effort: High".
+  const MODEL_RE = /\b(Opus|Sonnet|Haiku|Fable)\b/;
   for (const btn of document.querySelectorAll('button')) {
-    const truncate = btn.querySelector('.truncate');
-    if (!truncate) continue;
-    const text = truncate.textContent?.trim() ?? '';
-    if (text.includes('Opus') || text.includes('Sonnet') || text.includes('Haiku')) {
-      model  = text;
-      effort = btn.querySelector('.text-t6')?.textContent?.replace('· ', '').trim() ?? null;
-      break;
+    const text = (btn.textContent ?? '').trim();
+    if (!text || text.length > 40) continue;
+
+    const em = text.match(/^Effort:\s*(.+)$/i);
+    if (em) { effort ??= em[1].trim(); continue; }
+
+    if (!model && MODEL_RE.test(text)) {
+      model = text;
+      // Legacy layout: effort rode inside the model button as a .text-t6 span.
+      effort ??= btn.querySelector('.text-t6')?.textContent?.replace('· ', '').trim() ?? null;
     }
   }
 
@@ -602,9 +612,28 @@ async function injectPrompt(text, { sessionId } = {}) {
     key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
     bubbles: true, cancelable: true,
   }));
-  await sleep(300);
 
-  // Fallback: full mouse event sequence on the send button
+  // Enter usually SUBMITS, and the step below is a FALLBACK for when it does
+  // not — but it used to run unconditionally. Once a submit lands, claude.ai
+  // clears the composer and swaps the send control out for the running turn's
+  // stop button, so findSendButton() returned null and this threw "Send button
+  // not found" for a prompt that had already been delivered (2026-08-26).
+  //
+  // That is the most damaging shape of failure in this file: inject's contract
+  // tells callers a failed inject may be retried, so a false negative here
+  // double-posts into live work. Prove the submit instead of assuming it.
+  //
+  // Two signals count as delivered, because create and inject end differently:
+  //   emptied   — the composer was cleared in place (inject, same page)
+  //   detached  — React unmounted this node routing to the new session (create)
+  const submitted = await pollUntil(
+    () => !input.isConnected || (input.textContent || '').trim() === '',
+    3000,
+  );
+  if (submitted) return;
+
+  // Composer still holds the text: Enter did not submit. Now the button is a
+  // genuine fallback, and its absence is a genuine failure.
   const send = findSendButton();
   if (!send) throw new Error('Send button not found');
   send.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, buttons: 1 }));
@@ -750,8 +779,17 @@ function controlLabels(el) {
 // shortcut. Labels are split across spans ("New⇧⌘O"), so match by prefix via
 // controlLabels rather than equality.
 function findNewSessionButton() {
+  // Match the ELEMENT TYPE loosely. claude.ai rebuilt the sidebar as anchors
+  // (`<a data-row-main-button href="/code">`) rather than buttons, and these
+  // selectors were scoped to `button` — so on 2026-08-26 this returned null on
+  // every session page, goToBlankComposer's `.df-pill` fallback was gone too,
+  // and create_session died with "neither the sidebar Code tab nor a New
+  // control was found" from any tab parked on a session. That is the outage
+  // loom reported as a navigation fault. Role, not tag name, is what identifies
+  // this control, so never re-narrow these to a single element type.
   const candidates = [...document.querySelectorAll(
-    'button[aria-keyshortcuts="Shift+Meta+O"], button[data-row-main-button]',
+    'button[aria-keyshortcuts="Shift+Meta+O"], button[data-row-main-button], ' +
+    'a[aria-keyshortcuts="Shift+Meta+O"], a[data-row-main-button]',
   )].filter(b => !b.closest(SEL.sessionRow) && controlLabels(b).some(n => /^new\b/i.test(n)));
 
   // Prefer the control carrying the code sidebar's own icon slot; only fall
@@ -813,10 +851,22 @@ function assertOnBlankComposer(what) {
 // Tried before clicking "New" because it cannot land on the wrong surface, and
 // returns false rather than throwing so the caller can fall back.
 async function goToBlankComposer() {
-  // Scope to the sidebar's own pills (.df-pill, e.g. Home/Code) rather than any
-  // element whose text starts with "Code".
-  const tab = [...document.querySelectorAll('.df-pill')]
-    .find(el => controlLabels(el).some(n => /^code\b/i.test(n)));
+  // Find the route by its DESTINATION, not its label or its styling class.
+  // This used to scope to `.df-pill` (the old Home/Code pills); that class no
+  // longer exists anywhere in the sidebar as of 2026-08-26, so this silently
+  // returned false and left create_session with no fallback at all once
+  // findNewSessionButton also broke. An href of exactly /code is the blank
+  // composer by definition, which makes this the one lookup here that does not
+  // depend on how claude.ai labels or classes the control. `.df-pill` is kept
+  // as a legacy path for older builds still in the fleet.
+  const isCodeHref = el => {
+    const href = el.getAttribute('href');
+    return href === '/code' || href === '/code/' || (href?.startsWith('/code?') ?? false);
+  };
+
+  const tab = [...document.querySelectorAll('a[href]')].find(isCodeHref)
+    ?? [...document.querySelectorAll('.df-pill')]
+         .find(el => controlLabels(el).some(n => /^code\b/i.test(n)));
   if (!tab) return false;
 
   tab.click();
