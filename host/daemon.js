@@ -39,6 +39,14 @@ let extension    = null;   // {version, id, since} reported by the loaded extens
 // correct rather than broken: with an unpacked load the running extension IS the
 // working tree, so there is no staged-vs-running skew to detect.
 const CHROME_USER_DATA_DIR = process.env.CHROME_USER_DATA_DIR || join(homedir(), '.config', 'google-chrome');
+// Which profile inside that directory holds the install. Chrome only calls it
+// "Default" for the first profile a browser ever created; a box whose Chrome
+// was launched with --profile-directory, or that grew a second profile, keeps
+// its extensions under "Profile 1", "Profile 2", or a custom name. Hardcoding
+// "Default" therefore read null on those boxes and silently disabled staleness
+// detection — the exact failure this probe exists to catch. Set this only to
+// pin a specific profile; left unset, every profile is searched.
+const CHROME_PROFILE_DIR = process.env.CHROME_PROFILE_DIR || null;
 // The relay learns the id from the extension's hello, so this is only needed to
 // report on-disk state while nothing is connected.
 const EXTENSION_ID_HINT = process.env.CLAUDE_BRIDGE_EXTENSION_ID || null;
@@ -58,16 +66,11 @@ function compareVersionParts(a, b) {
   return 0;
 }
 
-// Highest version Chrome has unpacked for our extension. Returns null whenever
-// that cannot be established — unknown id, unreadable directory, non-default
-// profile, or an unpacked load. Null must read as "unknown", never as "agrees
-// with what is running": a probe that cannot see the disk is not evidence of
-// health.
-function installedExtensionVersion() {
-  const id = extension?.id ?? EXTENSION_ID_HINT;
-  if (!id) return null;
+// Highest version Chrome has unpacked for our extension under one profile, or
+// null when that profile has no install (or cannot be read).
+function installedVersionInProfile(profileDir, id) {
   try {
-    const versions = readdirSync(join(CHROME_USER_DATA_DIR, 'Default', 'Extensions', id), { withFileTypes: true })
+    const versions = readdirSync(join(CHROME_USER_DATA_DIR, profileDir, 'Extensions', id), { withFileTypes: true })
       .filter(entry => entry.isDirectory())
       .map(entry => parseVersionDir(entry.name))
       .filter(Boolean)
@@ -76,6 +79,44 @@ function installedExtensionVersion() {
   } catch {
     return null;
   }
+}
+
+// Every directory in the user data dir that could be a profile. Chrome's own
+// names are "Default" and "Profile N", but --profile-directory accepts any
+// name, so this enumerates everything and lets the Extensions/<id> lookup do
+// the filtering: a non-profile directory (Crashpad, ShaderCache, …) simply has
+// no install to find.
+function candidateProfileDirs() {
+  if (CHROME_PROFILE_DIR) return [CHROME_PROFILE_DIR];
+  try {
+    return readdirSync(CHROME_USER_DATA_DIR, { withFileTypes: true })
+      .filter(entry => entry.isDirectory())
+      .map(entry => entry.name);
+  } catch {
+    return [];
+  }
+}
+
+// Highest version Chrome has unpacked for our extension. Returns null whenever
+// that cannot be established — unknown id, unreadable directory, no profile
+// carrying the extension, or an unpacked load. Null must read as "unknown",
+// never as "agrees with what is running": a probe that cannot see the disk is
+// not evidence of health.
+//
+// Profiles that disagree also read null. Only one of them is the profile Chrome
+// is actually running the extension from, and nothing here can tell which; the
+// alternative — picking the highest — would invent staleness on a box whose
+// second profile happens to carry an older copy. Pin CHROME_PROFILE_DIR to
+// resolve that case.
+function installedExtensionVersion() {
+  const id = extension?.id ?? EXTENSION_ID_HINT;
+  if (!id) return null;
+  const found = new Set(
+    candidateProfileDirs()
+      .map(profileDir => installedVersionInProfile(profileDir, id))
+      .filter(Boolean),
+  );
+  return found.size === 1 ? [...found][0] : null;
 }
 
 // ── Relay downtime ────────────────────────────────────────────────────────────
