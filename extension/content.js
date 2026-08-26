@@ -915,6 +915,45 @@ function selectedRepoFullName() {
     : null;
 }
 
+// Non-destructive proof that the create path can act, not merely read. This
+// intentionally shares the same navigation helpers and composer assertions as
+// createSession: list_sessions can succeed through the account API while the
+// sidebar controls needed to reach a new-session composer are broken.
+async function preflightCreateSession() {
+  let arrived = onBlankComposer();
+
+  if (!arrived) {
+    const newBtn = findNewSessionButton();
+    if (newBtn) {
+      newBtn.click();
+      arrived = await awaitBlankComposer(8000);
+      relayLog(`create_session_preflight: New click → ${arrived ? 'blank composer' : 'failed'} (${location.pathname})`);
+    }
+
+    if (!arrived) {
+      arrived = await goToBlankComposer();
+      relayLog(`create_session_preflight: Code route → ${arrived ? 'blank composer' : 'failed'} (${location.pathname})`);
+    }
+  }
+
+  if (!arrived) {
+    throw new Error(
+      `Create preflight could not reach the blank composer from ${location.pathname}; ` +
+      'the bridge read path may still be healthy, but session creation is unavailable'
+    );
+  }
+  if (!location.pathname.startsWith('/code')) {
+    throw new Error(`Create preflight landed on ${location.pathname}, not the code composer`);
+  }
+
+  assertOnBlankComposer('create_session_preflight');
+  if (!repoTriggerEl()) {
+    throw new Error('Create preflight found the blank composer but no repository selector');
+  }
+
+  return { ready: true, path: location.pathname, repoControl: true };
+}
+
 // Create a new session. Clicking "New" only opens a blank composer; the
 // session itself is created server-side when the first prompt is submitted, and
 // its ID then appears in the URL. So the order is: open composer → pick repo →
@@ -923,6 +962,10 @@ async function createSession({ model, effort, prompt, repo } = {}) {
   if (!prompt) throw new Error('A prompt is required to create a session');
 
   relayLog(`create_session: starting on ${location.pathname} (focusedRow=${activeSessionId() ?? 'none'})`);
+
+  // Step 0 health checks call this directly, and real creates call the exact
+  // same proof before touching a repo, model, effort, or prompt.
+  await preflightCreateSession();
 
   // /code already mounts a blank composer, so routing is often unnecessary —
   // but skip it only when onBlankComposer() proves the page carries no session.
@@ -1659,6 +1702,12 @@ chrome.runtime.onMessage.addListener((msg) => {
             (delivery.reason ? ` reason=${delivery.reason}` : '')
           );
           respond(requestId, { ok: true, ...delivery });
+          break;
+        }
+
+        case 'create_session_preflight': {
+          const readiness = await withNavLock(() => preflightCreateSession());
+          respond(requestId, { ok: true, ...readiness });
           break;
         }
 

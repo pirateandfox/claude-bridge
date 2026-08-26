@@ -160,7 +160,8 @@ async function onDaemonMessage(msg) {
   // content script can route itself off a session page now, but starting from
   // the composer avoids the navigation entirely.
   const isComposer = t => /^https:\/\/claude\.ai\/code\/?(\?|#|$)/.test(t.url ?? '');
-  const codeTab = cmd === 'create_session'
+  const needsComposer = cmd === 'create_session' || cmd === 'create_session_preflight';
+  const codeTab = needsComposer
     ? (tabs.find(isComposer) ?? tabs.find(t => t.url?.includes('/code')))
     : tabs.find(t => t.url?.includes('/code'));
   const tab = codeTab ?? tabs.find(t => t.active) ?? tabs[0];

@@ -168,7 +168,13 @@ const queue           = [];
 // URL. That legitimately exceeded 60s on 2026-08-08 — the session was created
 // correctly but the caller got a timeout error, which is the worst outcome:
 // a retry would create a SECOND session for the same task.
-const TIMEOUTS = { inject: 60_000, get_state: 60_000, warm_sessions: 120_000, create_session: 150_000 };
+const TIMEOUTS = {
+  inject: 60_000,
+  get_state: 60_000,
+  warm_sessions: 120_000,
+  create_session_preflight: 30_000,
+  create_session: 150_000,
+};
 
 function sendToChrome(cmd, params = {}) {
   return new Promise((resolve, reject) => {
@@ -394,6 +400,11 @@ const TOOLS = [
     },
   },
   {
+    name: 'claude_session_create_preflight',
+    description: 'Non-destructive create-path health check. Navigates the shared claude.ai tab to the blank Code composer and verifies both the prompt surface and repository selector are present. This creates no session and submits no prompt. Use it before unattended dispatch; claude_sessions_list proves only the read path.',
+    inputSchema: { type: 'object', properties: {}, required: [] },
+  },
+  {
     name: 'claude_session_create',
     description: 'Open a new Claude Code session. A repo and an initial prompt are required: clicking "New session" only opens a blank composer, and the session is created when the prompt is submitted against the chosen repo.',
     inputSchema: {
@@ -503,6 +514,15 @@ function createMcpServer() {
             sessionId: args.session_id,
             verified:  r?.verified ?? false,
             turnId:    r?.turnId ?? null,
+          };
+          break;
+        }
+        case 'claude_session_create_preflight': {
+          const r = await sendToChrome('create_session_preflight');
+          result = {
+            ready: r.ready === true,
+            path: r.path ?? null,
+            repoControl: r.repoControl === true,
           };
           break;
         }

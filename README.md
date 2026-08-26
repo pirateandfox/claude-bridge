@@ -35,6 +35,7 @@ claude.ai session
 | `claude_sessions_list` | List all sessions visible in the sidebar |
 | `claude_session_get_state` | Get state, branch info, CI status, model, and usage % |
 | `claude_session_inject` | Submit a prompt to a session |
+| `claude_session_create_preflight` | Verify the create path can reach a blank Code composer without creating a session |
 | `claude_session_create` | Open a new session with optional model, effort, and initial prompt |
 | `claude_session_archive` | Archive a session |
 | `claude_session_create_pr` | Click "Create PR" for a session with an open branch |
@@ -107,11 +108,12 @@ curl http://127.0.0.1:7878/health
 Once installed, the MCP tools are available to any agent connected to `http://127.0.0.1:7878/mcp`. Example workflow:
 
 ```
-1. claude_sessions_list          → get session IDs
-2. claude_session_get_state      → check if running/ready
-3. claude_session_inject         → send a follow-up prompt
-4. claude_session_get_state      → poll until state returns to "ready"
-5. claude_session_get_transcript → read the result
+1. claude_sessions_list             → get session IDs
+2. claude_session_create_preflight  → prove unattended creation can reach the composer
+3. claude_session_get_state         → check if running/ready
+4. claude_session_inject            → send a follow-up prompt
+5. claude_session_get_state         → poll until state returns to "ready"
+6. claude_session_get_transcript    → read the result
 ```
 
 ## Logs & Debugging
