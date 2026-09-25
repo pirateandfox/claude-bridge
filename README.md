@@ -33,7 +33,8 @@ claude.ai session
 | Tool | Description |
 |------|-------------|
 | `claude_sessions_list` | List all sessions visible in the sidebar |
-| `claude_session_get_state` | Get state, branch info, CI status, model, and usage % |
+| `claude_session_get_state` | Get state, branch info, CI status, model, usage %, and any pending approval card |
+| `claude_session_respond_approval` | Answer a pending tool-permission card by option number or label |
 | `claude_session_inject` | Submit a prompt to a session |
 | `claude_session_create_preflight` | Verify the create path can reach a blank Code composer without creating a session |
 | `claude_session_create` | Open a new session with optional model, effort, and initial prompt |
@@ -42,7 +43,7 @@ claude.ai session
 | `claude_session_set_ci_options` | Toggle auto-fix CI and auto-merge checkboxes |
 | `claude_session_get_transcript` | Read the full conversation transcript |
 
-Session state values: `running`, `ready`, `merged`, `pr_open`, `pr_closed`
+Session state values: `running`, `ready`, `awaiting_approval`, `archived`, `unknown`
 
 ## Requirements
 

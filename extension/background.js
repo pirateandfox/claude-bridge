@@ -159,11 +159,19 @@ async function onDaemonMessage(msg) {
   // the same tab id, which reads like a race but is just a stuck tab. The
   // content script can route itself off a session page now, but starting from
   // the composer avoids the navigation entirely.
+  //
+  // "On the Code sessions page" means the composer or a session route ONLY.
+  // This used to be `url.includes('/code')`, which also matches
+  // /code/artifact/… — a page with no session sidebar. An artifact open in any
+  // claude.ai tab then won the selection, every row lookup missed, and get_state
+  // silently degraded to API-only (2026-09-25).
   const isComposer = t => /^https:\/\/claude\.ai\/code\/?(\?|#|$)/.test(t.url ?? '');
+  const isCodeApp  = t => /^https:\/\/claude\.ai\/code\/?(session_[A-Za-z0-9]+\/?)?(\?|#|$)/.test(t.url ?? '');
   const needsComposer = cmd === 'create_session' || cmd === 'create_session_preflight';
+  const codeTabs = tabs.filter(isCodeApp);
   const codeTab = needsComposer
-    ? (tabs.find(isComposer) ?? tabs.find(t => t.url?.includes('/code')))
-    : tabs.find(t => t.url?.includes('/code'));
+    ? (codeTabs.find(isComposer) ?? codeTabs.find(t => t.active) ?? codeTabs[0])
+    : (codeTabs.find(t => t.active) ?? codeTabs[0]);
   const tab = codeTab ?? tabs.find(t => t.active) ?? tabs[0];
   // Logs which tab a command was routed to — a login/interstitial URL here
   // explains a hung command (the in-page API fetch never authenticates).

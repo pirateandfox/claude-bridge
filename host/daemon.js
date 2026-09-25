@@ -174,6 +174,7 @@ const TIMEOUTS = {
   warm_sessions: 120_000,
   create_session_preflight: 30_000,
   create_session: 150_000,
+  respond_approval: 60_000,
 };
 
 function sendToChrome(cmd, params = {}) {
@@ -359,7 +360,7 @@ createNetServer((sock) => {
 const TOOLS = [
   {
     name: 'claude_sessions_list',
-    description: 'List active (non-archived) Claude Code cloud sessions — the ones still visible in the sidebar. Archived sessions are finished work retained only for history and are excluded by default; pass include_archived: true to get the full account history instead. Each row carries workerStatus (idle|… — the reliable busy/idle signal) and statusBucket, whose semantics are UNVERIFIED and must not be routed on — see claude_session_get_state for what has been ruled out.',
+    description: 'List active (non-archived) Claude Code cloud sessions — the ones still visible in the sidebar. Archived sessions are finished work retained only for history and are excluded by default; pass include_archived: true to get the full account history instead. Rows whose session is blocked on a tool-permission card have state "awaiting_approval" and needsHuman: true — use claude_session_get_state for what the card says. Each row carries workerStatus (idle|… — the reliable busy/idle signal) and statusBucket, whose semantics are UNVERIFIED and must not be routed on — see claude_session_get_state for what has been ruled out.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -378,13 +379,26 @@ const TOOLS = [
   },
   {
     name: 'claude_session_get_state',
-    description: 'Get detailed state for a specific session. `state` (running/ready/archived/unknown) now comes from the API, so it is reliable without warming — "running" means the session is actually working, "unknown" means neither the API nor the DOM could answer and must be treated as busy, never as idle. Also returns workerStatus (idle|… — the raw busy signal; this one is reliable) and statusBucket (review_ready|blocked|completed|failed). WARNING: statusBucket semantics are UNVERIFIED — do NOT route work on it. It is passed through raw for observation only. Ruled out on 2026-08-03: it is not "PR merged" (two blocked sessions had open PRs), not derived from PR state (an open+conflicting PR appeared in both buckets), and not "ended asking a human" (a blocked session asked nothing; a review_ready one asked). A merged, finished session still reads "blocked", so it does not clear on completion and cannot mean "needs attention". branchBar/prUrl/model/effort are still scraped from the UI and are null until the session has been warmed — that reads as "no PR" rather than "not loaded", so call claude_sessions_warm before a batch read if you need branch data. usagePct is the ACCOUNT plan meter, global and identical for every session.',
+    description: 'Get detailed state for a specific session. `state` (running/ready/awaiting_approval/archived/unknown) now comes from the API, so it is reliable without warming — "running" means the session is actually working, "awaiting_approval" means it is blocked on a tool-permission card (workerStatus "requires_action") and will not proceed until someone answers it; the session is flagged if EITHER the API reports it or a card is showing on the page. needsHuman is true in exactly that case: stop and get a person to answer. `approval` then holds { title, action, fields: [{label, value}], options: [{digit, label}], text } read off the card — `text` is all the visible text on the card and is always there even when title/fields could not be parsed from an unfamiliar card layout; approval is null only if the card could not be read at all, and claude_session_respond_approval answers it. "unknown" means neither the API nor the DOM could answer and must be treated as busy, never as idle. Also returns workerStatus (idle|… — the raw busy signal; this one is reliable) and statusBucket (review_ready|blocked|completed|failed). WARNING: statusBucket semantics are UNVERIFIED — do NOT route work on it. It is passed through raw for observation only. Ruled out on 2026-08-03: it is not "PR merged" (two blocked sessions had open PRs), not derived from PR state (an open+conflicting PR appeared in both buckets), and not "ended asking a human" (a blocked session asked nothing; a review_ready one asked). A merged, finished session still reads "blocked", so it does not clear on completion and cannot mean "needs attention". branchBar/prUrl/model/effort are still scraped from the UI and are null until the session has been warmed — that reads as "no PR" rather than "not loaded", so call claude_sessions_warm before a batch read if you need branch data. usagePct is the ACCOUNT plan meter, global and identical for every session.',
     inputSchema: {
       type: 'object',
       properties: {
         session_id: { type: 'string', description: 'Session ID from claude_sessions_list' },
       },
       required: ['session_id'],
+    },
+  },
+  {
+    name: 'claude_session_respond_approval',
+    description: 'Answer a pending tool-permission card on a session (state "awaiting_approval"). Options are read off the card itself, which numbers them 1..N (commonly 1="Deny", 2="Allow once", but cards can offer more) — read them from claude_session_get_state `approval.options` first. `choice` is the option digit or its exact label (case-insensitive). Pass expected_action (a substring of `approval.action`, e.g. "send later") so a different card that replaced the one you read is never answered by mistake. Clicks nothing and errors if the tab cannot be confirmed on session_id, there is no card, the choice is not on it, or the card has no numbered options. Returns { clicked: {digit, label}, approval, resolved } — resolved:false means the card was still showing 5s after the click; re-read get_state before retrying.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id:      { type: 'string' },
+        choice:          { type: ['string', 'number'], description: 'Option digit (1-based, as on the card) or its label, e.g. "Allow once" or "Deny"' },
+        expected_action: { type: 'string', description: 'Substring the card\'s action must contain (e.g. "send later"); guards against answering the wrong card' },
+      },
+      required: ['session_id', 'choice'],
     },
   },
   {
@@ -501,7 +515,12 @@ function createMcpServer() {
         }
         case 'claude_session_get_state': {
           const r = await sendToChrome('get_state', { sessionId: args.session_id });
-          result  = { state: r.state, statusBucket: r.statusBucket ?? null, workerStatus: r.workerStatus ?? null, branchBar: r.branchBar, prUrl: r.branchBar?.prUrl ?? null, model: r.model, effort: r.effort, usagePct: r.usagePct };
+          result  = { state: r.state, needsHuman: r.needsHuman === true, statusBucket: r.statusBucket ?? null, workerStatus: r.workerStatus ?? null, branchBar: r.branchBar, prUrl: r.branchBar?.prUrl ?? null, model: r.model, effort: r.effort, usagePct: r.usagePct, approval: r.approval ?? null };
+          break;
+        }
+        case 'claude_session_respond_approval': {
+          const r = await sendToChrome('respond_approval', { sessionId: args.session_id, choice: args.choice, expectAction: args.expected_action });
+          result = { clicked: r.clicked, approval: r.approval, resolved: r.resolved === true };
           break;
         }
         case 'claude_session_inject': {

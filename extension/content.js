@@ -24,6 +24,14 @@ const SEL = {
   addRepoBtn:    'button[role="combobox"][aria-label="Add repository"]',  // the "+" — never click for selection
   repoOption:    '[role="option"], [cmdk-item], [role="menuitemradio"]',  // repo entries in the open picker
   repoSearch:    'input[placeholder="Search repos…"]',               // type-to-filter input (… is U+2026)
+  // Tool-permission card ("Allow Claude to use X?"). The card numbers its own
+  // buttons: the root carries data-approval-card-digits="N" and each button's
+  // label span carries data-approval-digit="1".."N", so the option set is read
+  // off the card rather than assumed to be Deny / Allow once.
+  approvalCard:  '[data-approval-card-root]',
+  approvalTitle: '[data-approval-value]',
+  approvalDigit: '[data-approval-digit]',
+  approvalSent:  'ul[aria-label="What Claude sent"] > li',
 };
 
 function sessionIdFromKey(rowKey) {
@@ -233,7 +241,14 @@ async function readSessions(includeArchived = false) {
       // old code read it and silently got undefined for every row). `status` is
       // the session's own state; `worker_status` describes its container, used
       // only as a fallback.
-      state:     s.status ?? s.worker_status ?? 'unknown',
+      //
+      // Exception: a session parked on a permission card (worker_status
+      // "requires_action") is surfaced as awaiting_approval, so a caller scanning
+      // the list can see which sessions need a person without a get_state each.
+      state:     s.worker_status === 'requires_action'
+                   ? 'awaiting_approval'
+                   : (s.status ?? s.worker_status ?? 'unknown'),
+      needsHuman: s.worker_status === 'requires_action',
       repo:      s.session_context?.outcomes?.[0]?.git_info?.repo ?? null,
     });
 
@@ -302,6 +317,10 @@ async function readSessionMeta(sessionId) {
 function deriveSessionState(meta, domState) {
   if (meta) {
     const worker = String(meta.workerStatus ?? '').toLowerCase();
+    // A session parked on a permission card reports worker_status
+    // "requires_action" (confirmed 2026-09-25). It is not working and will not
+    // until someone answers, so reporting it as "running" hid it from callers.
+    if (worker === 'requires_action') return 'awaiting_approval';
     if (worker && worker !== 'idle') return 'running';
     if (String(meta.state ?? '').toLowerCase() === 'archived') return 'archived';
     if (worker === 'idle') return 'ready';
@@ -471,6 +490,128 @@ function readBranchBarFresh(sessionId, prevSig, navigated) {
 function branchBarSig(bb) {
   if (!bb) return null;
   return [bb.featureBranch, bb.repo, bb.prNumber, bb.additions, bb.deletions].join('|');
+}
+
+// The pending tool-permission card, or null. Document-global like the branch
+// bar, so callers must only trust this once the tab is proven parked on the
+// session (see approvalCardFresh).
+//
+// Returns { title, action, fields, options, el }:
+//   action  — "use send later (Claude Code Remote)", from "Allow Claude to …?"
+//   fields  — what Claude sent, [{ label, value }]
+//   options — every numbered button on the card, [{ digit, label }]
+function readApprovalCard() {
+  const el = document.querySelector(SEL.approvalCard);
+  if (!el) return null;
+
+  const title  = normText(el.querySelector(SEL.approvalTitle)?.textContent);
+  const action = title.match(/^Allow Claude to (.+?)\??$/i)?.[1] ?? null;
+
+  const fields = [...el.querySelectorAll(SEL.approvalSent)].map(li => ({
+    label: normText(li.children[0]?.textContent),
+    value: (li.children[1]?.textContent ?? '').trim(),
+  }));
+
+  const options = [...el.querySelectorAll(SEL.approvalDigit)]
+    .map(span => ({
+      digit:  Number(span.getAttribute('data-approval-digit')),
+      label:  normText(span.textContent),
+      button: span.closest('button'),
+    }))
+    .filter(o => o.button)
+    .sort((a, b) => a.digit - b.digit);
+
+  // The card's whole visible text, minus the buttons. `title` and `fields` rely
+  // on selectors matching the permission card; a different kind of card (a
+  // question, a plan approval) may not match them, and this keeps what it says
+  // readable anyway.
+  const parts = [];
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    if (n.parentElement?.closest('button, kbd, .sr-only, [hidden]')) continue;
+    const t = normText(n.textContent);
+    if (t) parts.push(t);
+  }
+  const text = parts.join(' ').replace(/ ([?.,:;!])/g, '$1');
+
+  return { title, action, fields, options, text, el };
+}
+
+// Serialisable view of a card, for responses.
+function approvalView(card) {
+  if (!card) return null;
+  return {
+    title:   card.title,
+    action:  card.action,
+    fields:  card.fields,
+    options: card.options.map(({ digit, label }) => ({ digit, label })),
+    text:    card.text,
+  };
+}
+
+function approvalSig(card) {
+  return card ? JSON.stringify(approvalView(card)) : null;
+}
+
+// Same identity discipline as readBranchBarFresh: after navigating, a card is
+// only this session's once it differs from the card the outgoing session showed
+// (a new DOM node, or new content).
+function approvalCardFresh(sessionId, prev, navigated) {
+  if (activeSessionId() !== sessionId || sessionIdFromUrl() !== sessionId) return null;
+  const card = readApprovalCard();
+  if (!card) return null;
+  if (!navigated || !prev) return card;
+  return (card.el !== prev.el || approvalSig(card) !== prev.sig) ? card : null;
+}
+
+// Answer the pending permission card on `sessionId`. `choice` is either the
+// option's digit (1-based, as shown on the card) or its label, case-insensitive
+// ("Allow once", "Deny", …). `expectAction`, when given, must appear in the
+// card's action text, so a caller that read one card cannot answer a different
+// one that replaced it in the meantime.
+async function respondApproval(sessionId, choice, expectAction) {
+  const prevCard = readApprovalCard();
+  const prev = prevCard ? { el: prevCard.el, sig: approvalSig(prevCard) } : null;
+  const navigated = activeSessionId() !== sessionId || sessionIdFromUrl() !== sessionId;
+  if (navigated) await navigateToSession(sessionId);
+
+  // Global card + global buttons — same gate as create_pr.
+  assertParkedOn(sessionId, 'respond_approval');
+
+  let card = null;
+  await pollUntil(() => (card = approvalCardFresh(sessionId, prev, navigated)), 5000);
+  if (!card) throw new Error('No pending approval card on this session');
+
+  if (expectAction && !normText(card.action ?? card.title).toLowerCase().includes(normText(expectAction).toLowerCase())) {
+    throw new Error(`Approval card is for "${card.action ?? card.title}", not "${expectAction}" — nothing clicked`);
+  }
+
+  const available = card.options.map(o => `${o.digit}="${o.label}"`).join(', ') || 'none';
+  if (card.options.length === 0) {
+    throw new Error(`Approval card has no numbered options — unrecognised card layout ("${card.title}"). Nothing clicked`);
+  }
+  const want = String(choice ?? '').trim();
+  const opt = /^\d+$/.test(want)
+    ? card.options.find(o => o.digit === Number(want))
+    : card.options.find(o => o.label.toLowerCase() === want.toLowerCase());
+  if (!opt) throw new Error(`No option "${want}" on the approval card (available: ${available}). Nothing clicked`);
+  if (opt.button.disabled || opt.button.getAttribute('aria-disabled') === 'true') {
+    throw new Error(`Option "${opt.label}" is disabled`);
+  }
+
+  // Clicking is irreversible; only start it if we can still report the result.
+  assertBudget('respond_approval', 8_000);
+  const answeredSig = approvalSig(card);
+  const answered = approvalView(card);
+  opt.button.click();
+
+  // Resolved once the card is gone or has been replaced by a different one.
+  const resolved = await pollUntil(() => {
+    const now = readApprovalCard();
+    return !now || approvalSig(now) !== answeredSig;
+  }, 5000);
+
+  return { clicked: { digit: opt.digit, label: opt.label }, approval: answered, resolved };
 }
 
 function findSendButton() {
@@ -1566,12 +1707,14 @@ chrome.runtime.onMessage.addListener((msg) => {
             respond(requestId, {
               ok: true,
               state:        deriveSessionState(meta, 'unknown'),
+              needsHuman:   deriveSessionState(meta, 'unknown') === 'awaiting_approval',
               statusBucket: meta.statusBucket ?? null,
               workerStatus: meta.workerStatus ?? null,
               branchBar: null,
               model:     null,
               effort:    null,
               usagePct:  null,
+              approval:  null,
             });
             break;
           }
@@ -1583,6 +1726,11 @@ chrome.runtime.onMessage.addListener((msg) => {
           // tab away mid-read — which is exactly how branchBar / model / effort /
           // usage previously came back keyed to whatever was last visible rather
           // than to msg.sessionId.
+          // State comes from the API, not the row — see readSessionMeta. Read it
+          // up front: it decides whether to wait for an approval card below.
+          const gsMeta  = await readSessionMeta(msg.sessionId);
+          const gsState = deriveSessionState(gsMeta, readRowState(row));
+
           const scraped = await withNavLock(async () => {
             const onSession = activeSessionId() === msg.sessionId
                            && sessionIdFromUrl() === msg.sessionId;
@@ -1590,8 +1738,10 @@ chrome.runtime.onMessage.addListener((msg) => {
 
             // Snapshot the OUTGOING session's bar BEFORE we navigate, so the
             // freshness check can tell THIS session's branch bar from a stale one
-            // lingering through the route transition.
+            // lingering through the route transition. Same for its approval card.
             const prevSig = navigated ? branchBarSig(readBranchBar()) : null;
+            const prevCardEl = navigated ? readApprovalCard() : null;
+            const prevCard = prevCardEl ? { el: prevCardEl.el, sig: approvalSig(prevCardEl) } : null;
 
             if (navigated) await navigateToSession(msg.sessionId);
 
@@ -1607,6 +1757,7 @@ chrome.runtime.onMessage.addListener((msg) => {
               const routeConfirmed = sessionIdFromUrl() === msg.sessionId;
               branchBar = readBranchBarFresh(msg.sessionId, prevSig, navigated);
               return branchBar
+                || approvalCardFresh(msg.sessionId, prevCard, navigated)
                 || (routeConfirmed
                     && document.querySelector(SEL.chatInput)
                     && !document.querySelector(SEL.branchBar));
@@ -1620,27 +1771,45 @@ chrome.runtime.onMessage.addListener((msg) => {
             // gating (an earlier attempt to "wait until it changes" wrongly forced
             // a timeout, since a global value never changes between sessions).
             const mev = readModelEffortUsage();
-            return { branchBar, model: mev.model, effort: mev.effort, usagePct: mev.usagePct };
+
+            // The permission card. Only wait for it when the API says the session
+            // is blocked on one — otherwise every get_state would pay the wait.
+            let approval = approvalCardFresh(msg.sessionId, prevCard, navigated);
+            if (!approval && gsState === 'awaiting_approval') {
+              await pollUntil(() => (approval = approvalCardFresh(msg.sessionId, prevCard, navigated)), 4000);
+            }
+
+            return { branchBar, model: mev.model, effort: mev.effort, usagePct: mev.usagePct, approval: approvalView(approval) };
           });
 
           // prUrl comes straight off the PR link in readBranchBar — no /v1/sessions
           // fetch needed (that had no timeout and could itself hang under the same
           // background-tab conditions).
-          // State comes from the API, not the row — see readSessionMeta. The DOM
-          // reading is kept only as a fallback for when the API cannot answer.
-          const gsMeta  = await readSessionMeta(msg.sessionId);
-          const gsState = deriveSessionState(gsMeta, readRowState(row));
-          relayLog(`get_state ${msg.sessionId}: state=${gsState} (worker=${gsMeta?.workerStatus ?? 'n/a'} bucket=${gsMeta?.statusBucket ?? 'n/a'}) branch=${scraped.branchBar?.featureBranch ?? 'none'} usagePct=${scraped.usagePct ?? 'n/a'}`);
+          //
+          // A card on screen means the session is waiting on a person, whatever
+          // the API said (or if it could not be reached) — the two signals are
+          // OR'd so a blocked session is flagged if either one sees it.
+          const finalState = scraped.approval && gsState !== 'archived' ? 'awaiting_approval' : gsState;
+          relayLog(`get_state ${msg.sessionId}: state=${finalState} (worker=${gsMeta?.workerStatus ?? 'n/a'} bucket=${gsMeta?.statusBucket ?? 'n/a'}) branch=${scraped.branchBar?.featureBranch ?? 'none'} usagePct=${scraped.usagePct ?? 'n/a'} approval=${scraped.approval?.action ?? 'none'}`);
           respond(requestId, {
             ok: true,
-            state: gsState,
+            state: finalState,
+            needsHuman: finalState === 'awaiting_approval',
             statusBucket: gsMeta?.statusBucket ?? null,
             workerStatus: gsMeta?.workerStatus ?? null,
             branchBar: scraped.branchBar,
             model:     scraped.model,
             effort:    scraped.effort,
             usagePct:  scraped.usagePct,
+            approval:  scraped.approval,
           });
+          break;
+        }
+
+        case 'respond_approval': {
+          const r = await withNavLock(() => respondApproval(msg.sessionId, msg.choice, msg.expectAction));
+          relayLog(`respond_approval ${msg.sessionId}: clicked ${r.clicked.digit}="${r.clicked.label}" on "${r.approval.action ?? r.approval.title}" resolved=${r.resolved}`);
+          respond(requestId, { ok: true, ...r });
           break;
         }
 
