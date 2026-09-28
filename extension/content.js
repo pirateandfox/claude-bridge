@@ -505,12 +505,18 @@ function branchBarSig(bb) {
 //                is numbered by a [data-approval-digit] span (1="Deny",
 //                2="Allow once", …). Clicking a button answers immediately.
 //   question   — no title span, no digit spans. The question text sits in a
-//                span; each option is a <button> holding <kbd>N</kbd>, a label
-//                div and a description div; a trailing "Other" button (digit
-//                N+1) reveals a textarea[aria-label="Other option"]; "Skip" and
-//                "Submit" buttons follow (Submit disabled until a pick). The
-//                header row has "View question options" / "Dismiss question"
-//                icon buttons. Clicking an option SELECTS it; Submit sends.
+//                span (prefixed "N / M" when the tool asked several questions);
+//                each option is a <button> with a label div and a description
+//                div. Single-select options carry <kbd>N</kbd> hotkeys;
+//                multi-select options carry aria-pressed instead and no digit,
+//                so digits are assigned by position. A trailing "Other" button
+//                pairs with textarea[aria-label="Other option"]; "Skip" and
+//                "Submit" (or "Next" when more questions follow) close the card,
+//                disabled until a pick. The header row has "View question
+//                options" / "Dismiss question" icon buttons. Clicking an option
+//                SELECTS it (toggles, for multi-select); Submit/Next sends.
+//                A multi-question card keeps the same tool id across its pages;
+//                `question.index` tells them apart.
 //
 // Which one it is comes from React, not the DOM: page-bridge.js (MAIN world)
 // reads the card component's `pendingApproval.tool` and tool.name is
@@ -532,6 +538,20 @@ function readApprovalMeta() {
     const meta = JSON.parse(payload);
     return meta && typeof meta === 'object' && meta.tool ? meta : null;
   } catch { return null; }
+}
+
+// "1 / 3" → { index: 1, total: 3 } from the question header, or null.
+function text_pager(el) {
+  for (const span of el.querySelectorAll('span')) {
+    if (span.children.length) continue;
+    const m = normText(span.textContent).match(/^(\d+)\s*\/\s*(\d+)$/);
+    if (m) return { index: Number(m[1]), total: Number(m[2]) };
+    // The pager may be split across sibling text nodes ("1", "/", "3").
+    const joined = normText([...span.parentElement?.childNodes ?? []].filter(n => n.nodeType === 3).map(n => n.textContent).join(''));
+    const m2 = joined.match(/^(\d+)\s*\/\s*(\d+)$/);
+    if (m2) return { index: Number(m2[1]), total: Number(m2[2]) };
+  }
+  return null;
 }
 
 // The pending card, or null. Document-global like the branch bar, so callers
@@ -572,14 +592,18 @@ function readApprovalCard() {
     .filter(o => o.button)
     .sort((a, b) => a.digit - b.digit);
 
-  // Question-card buttons, numbered by a <kbd> child.
+  // Question-card option buttons: a <kbd> hotkey (single-select) or an
+  // aria-pressed toggle (multi-select). Digits come from the kbd when there is
+  // one, else from position — the card itself shows none in that case.
   const kbdOptions = [...el.querySelectorAll('button')]
-    .filter(b => b.querySelector('kbd') && !b.querySelector(SEL.approvalDigit))
-    .map(b => {
+    .filter(b => !b.querySelector(SEL.approvalDigit) && !b.getAttribute('aria-label')
+              && (b.querySelector('kbd') || b.hasAttribute('aria-pressed')))
+    .map((b, i) => {
       const kbd    = b.querySelector('kbd');
       const leaves = [...b.querySelectorAll('div')].filter(d => d.childElementCount === 0);
-      const label  = normText(leaves[0]?.textContent) || normText(b.textContent.replace(kbd.textContent, ''));
-      return { digit: Number(kbd.textContent), label, description: normText(leaves[1]?.textContent) || null, button: b };
+      const label  = normText(leaves[0]?.textContent) || normText(b.textContent.replace(kbd?.textContent ?? '', ''));
+      const digit  = kbd ? Number(kbd.textContent) : i + 1;
+      return { digit, label, description: normText(leaves[1]?.textContent) || null, button: b };
     })
     .filter(o => Number.isFinite(o.digit))
     .sort((a, b) => a.digit - b.digit);
@@ -600,7 +624,10 @@ function readApprovalCard() {
   let controls = null;
   if (kind === 'question') {
     const questions = Array.isArray(meta?.tool?.input?.questions) ? meta.tool.input.questions : [];
-    const q = questions[0] ?? null;
+    // "1 / 3" pager when the tool asked several questions; absent for one.
+    const pager = text_pager(el);
+    const index = pager?.index ?? 1;
+    const q = questions[index - 1] ?? questions[0] ?? null;
     const otherOpt = kbdOptions.find(o => /^other$/i.test(o.label)) ?? null;
     const listed   = kbdOptions.filter(o => o !== otherOpt);
     // Claude's wording wins over the (possibly truncated) rendered text; the
@@ -611,14 +638,18 @@ function readApprovalCard() {
       description: q?.options?.[i]?.description ?? o.description,
       button:      o.button,
     }));
+    const submit = byText('Submit') ?? byText('Next');
     question = {
       header:        q?.header ?? null,
       question:      q?.question ?? null,
       multiSelect:   q?.multiSelect === true,
-      questionCount: questions.length || 1,
+      index,
+      questionCount: pager?.total ?? questions.length ?? 1,
       freeText:      textarea ? { digit: otherOpt?.digit ?? null } : null,
+      submitLabel:   submit ? normText(submit.textContent) : null,
+      selected:      listed.filter(o => o.button.getAttribute('aria-pressed') === 'true').map(o => o.digit),
     };
-    controls = { other: otherOpt?.button ?? null, textarea, submit: byText('Submit'), skip: byText('Skip') };
+    controls = { other: otherOpt?.button ?? null, textarea, submit, skip: byText('Skip') };
   }
 
   // The card's whole visible text, minus the buttons — readable whatever the
@@ -764,10 +795,12 @@ function answerPermissionCard(card, choice) {
   return { kind: 'permission', clicked: { digit: opt.digit, label: opt.label }, digits: [opt.digit], labels: [opt.label], text: null };
 }
 
-// Question card: clicking an option only selects it (Submit stays disabled
-// until something is picked, confirmed live 2026-09-28), so pick, then Submit.
-// If the card vanishes after the pick — a layout that auto-submits — that
-// counts as done. Free text goes through the "Other" option's textarea.
+// Question card: clicking an option only selects it (Submit/Next stays
+// disabled until something is picked, confirmed live 2026-09-28), so pick, then
+// Submit. If the card vanishes after the pick — a layout that auto-submits —
+// that counts as done. Free text goes through the "Other" option's textarea.
+// On a multi-question card, Next advances to the following question under the
+// same tool id: the caller re-reads get_state and answers again.
 async function answerQuestionCard(card, { choice, choices, text }) {
   const c = card.controls;
   const wants = (Array.isArray(choices) && choices.length ? choices : [choice])
@@ -799,6 +832,8 @@ async function answerQuestionCard(card, { choice, choices, text }) {
   const gone = () => { const now = readApprovalCard(); return !now || approvalSig(now) !== sig; };
 
   for (const opt of picked) {
+    // Multi-select buttons toggle; never un-pick one that is already selected.
+    if (opt.button.getAttribute('aria-pressed') === 'true') continue;
     opt.button.click();
     await pollUntil(() => gone() || opt.button.getAttribute('aria-pressed') === 'true' || opt.button.getAttribute('aria-checked') === 'true' || (c.submit && !c.submit.disabled), 1500);
   }
@@ -816,8 +851,8 @@ async function answerQuestionCard(card, { choice, choices, text }) {
 
   await pollUntil(() => gone() || (c.submit && !c.submit.disabled), 3000);
   if (!gone()) {
-    if (!c.submit) throw new Error('Selection made but the card has no Submit button — nothing submitted');
-    if (c.submit.disabled) throw new Error('Selection made but Submit stayed disabled — nothing submitted; the card may still show the selection');
+    if (!c.submit) throw new Error('Selection made but the card has no Submit/Next button — nothing submitted');
+    if (c.submit.disabled) throw new Error(`Selection made but ${normText(c.submit.textContent)} stayed disabled — nothing submitted; the card may still show the selection`);
     c.submit.click();
   }
 
