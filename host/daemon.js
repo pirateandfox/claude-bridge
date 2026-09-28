@@ -379,7 +379,7 @@ const TOOLS = [
   },
   {
     name: 'claude_session_get_state',
-    description: 'Get detailed state for a specific session. `state` (running/ready/awaiting_approval/archived/unknown) now comes from the API, so it is reliable without warming — "running" means the session is actually working, "awaiting_approval" means it is blocked on a tool-permission card (workerStatus "requires_action") and will not proceed until someone answers it; the session is flagged if EITHER the API reports it or a card is showing on the page. needsHuman is true in exactly that case: stop and get a person to answer. `approval` then holds { title, action, fields: [{label, value}], options: [{digit, label}], text } read off the card — `text` is all the visible text on the card and is always there even when title/fields could not be parsed from an unfamiliar card layout; approval is null only if the card could not be read at all, and claude_session_respond_approval answers it. "unknown" means neither the API nor the DOM could answer and must be treated as busy, never as idle. Also returns workerStatus (idle|… — the raw busy signal; this one is reliable) and statusBucket (review_ready|blocked|completed|failed). WARNING: statusBucket semantics are UNVERIFIED — do NOT route work on it. It is passed through raw for observation only. Ruled out on 2026-08-03: it is not "PR merged" (two blocked sessions had open PRs), not derived from PR state (an open+conflicting PR appeared in both buckets), and not "ended asking a human" (a blocked session asked nothing; a review_ready one asked). A merged, finished session still reads "blocked", so it does not clear on completion and cannot mean "needs attention". branchBar/prUrl/model/effort are still scraped from the UI and are null until the session has been warmed — that reads as "no PR" rather than "not loaded", so call claude_sessions_warm before a batch read if you need branch data. usagePct is the ACCOUNT plan meter, global and identical for every session.',
+    description: 'Get detailed state for a specific session. `state` (running/ready/awaiting_approval/archived/unknown) now comes from the API, so it is reliable without warming — "running" means the session is actually working, "awaiting_approval" means it is blocked on a tool-permission card (workerStatus "requires_action") and will not proceed until someone answers it; the session is flagged if EITHER the API reports it or a card is showing on the page. needsHuman is true in exactly that case: stop and get a person to answer. `approval` then describes the card. `approval.kind` says what it is: "permission" (Claude asking to use a tool / run a command — `action` is "use X" from the "Allow Claude to …?" title, `fields` is what Claude sent, `options` is [{digit, label}] e.g. 1="Deny", 2="Allow once"), "question" (Claude asking the user to choose or answer via AskUserQuestion — `question` is { header, question, multiSelect, questionCount, freeText }, `options` is [{digit, label, description}] exactly as Claude presented them, and freeText non-null means an "Other" free-text answer is accepted), or "unknown" (layout not recognised — `text`, the card\'s full visible text, is always present so a person can still read it). `approval.id` is the tool_use id Claude is blocked on: stable for the card\'s life, pass it back as approval_id when answering so the bridge refuses if a different card has replaced it. `approval.tool` is { id, name, input } — the raw tool call (input strings capped). approval is null only if no card could be read at all. claude_session_respond_approval answers it. "unknown" means neither the API nor the DOM could answer and must be treated as busy, never as idle. Also returns workerStatus (idle|… — the raw busy signal; this one is reliable) and statusBucket (review_ready|blocked|completed|failed). WARNING: statusBucket semantics are UNVERIFIED — do NOT route work on it. It is passed through raw for observation only. Ruled out on 2026-08-03: it is not "PR merged" (two blocked sessions had open PRs), not derived from PR state (an open+conflicting PR appeared in both buckets), and not "ended asking a human" (a blocked session asked nothing; a review_ready one asked). A merged, finished session still reads "blocked", so it does not clear on completion and cannot mean "needs attention". branchBar/prUrl/model/effort are still scraped from the UI and are null until the session has been warmed — that reads as "no PR" rather than "not loaded", so call claude_sessions_warm before a batch read if you need branch data. usagePct is the ACCOUNT plan meter, global and identical for every session.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -390,15 +390,19 @@ const TOOLS = [
   },
   {
     name: 'claude_session_respond_approval',
-    description: 'Answer a pending tool-permission card on a session (state "awaiting_approval"). Options are read off the card itself, which numbers them 1..N (commonly 1="Deny", 2="Allow once", but cards can offer more) — read them from claude_session_get_state `approval.options` first. `choice` is the option digit or its exact label (case-insensitive). Pass expected_action (a substring of `approval.action`, e.g. "send later") so a different card that replaced the one you read is never answered by mistake. Clicks nothing and errors if the tab cannot be confirmed on session_id, there is no card, the choice is not on it, or the card has no numbered options. Returns { clicked: {digit, label}, approval, resolved } — resolved:false means the card was still showing 5s after the click; re-read get_state before retrying.',
+    description: 'Answer the pending card on a session (state "awaiting_approval"). Read claude_session_get_state `approval` first: `kind` says whether it is a "permission" card or a "question" card, and `options` lists what can be picked (numbered 1..N as on the card). Permission: `choice` is the option digit or exact label (case-insensitive), commonly 1="Deny" or 2="Allow once"; one click answers it. Question: `choice` picks one option (digit or label), `choices` picks several when `approval.question.multiSelect` is true, `text` sends a free-text answer through the card\'s "Other" option (only when `approval.question.freeText` is non-null), and choice "skip" presses Skip; the bridge selects and then presses Submit. Guards, all optional: approval_id (the `approval.id` you read — refused if the pending card is a different one), expected_action (substring the card\'s action or question must contain). decision_id is the caller\'s own id for this decision; it is echoed back unchanged and written to the bridge log so the two sides\' approval logs can be reconciled. Clicks nothing and errors if the tab cannot be confirmed on session_id, there is no card, the card is "unknown", or the choice is not on it. Returns { applied: {kind, digits, labels, text, clicked}, clicked, approval, approvalId, approvalIdVerified, decisionId, resolved } — `applied` is exactly what was pressed; resolved:false means the card was still showing 5s after the answer; re-read get_state before retrying.',
     inputSchema: {
       type: 'object',
       properties: {
         session_id:      { type: 'string' },
-        choice:          { type: ['string', 'number'], description: 'Option digit (1-based, as on the card) or its label, e.g. "Allow once" or "Deny"' },
-        expected_action: { type: 'string', description: 'Substring the card\'s action must contain (e.g. "send later"); guards against answering the wrong card' },
+        choice:          { type: ['string', 'number'], description: 'Option digit (1-based, as on the card) or its label, e.g. "Allow once", "Deny", or a question option; "skip" skips a question' },
+        choices:         { type: 'array', items: { type: ['string', 'number'] }, description: 'Several option digits/labels — multi-select questions only' },
+        text:            { type: 'string', description: 'Free-text answer for a question card\'s "Other" option' },
+        approval_id:     { type: 'string', description: 'The approval.id read from get_state; the bridge refuses if a different card is now pending' },
+        expected_action: { type: 'string', description: 'Substring the card\'s action or question must contain (e.g. "send later"); guards against answering the wrong card' },
+        decision_id:     { type: 'string', description: 'Caller\'s own decision id (e.g. FlightDesk decisionId); echoed back and logged, never interpreted' },
       },
-      required: ['session_id', 'choice'],
+      required: ['session_id'],
     },
   },
   {
@@ -519,8 +523,15 @@ function createMcpServer() {
           break;
         }
         case 'claude_session_respond_approval': {
-          const r = await sendToChrome('respond_approval', { sessionId: args.session_id, choice: args.choice, expectAction: args.expected_action });
-          result = { clicked: r.clicked, approval: r.approval, resolved: r.resolved === true };
+          const r = await sendToChrome('respond_approval', {
+            sessionId: args.session_id, choice: args.choice, choices: args.choices, text: args.text,
+            expectAction: args.expected_action, approvalId: args.approval_id, decisionId: args.decision_id,
+          });
+          result = {
+            applied: r.applied, clicked: r.clicked, approval: r.approval,
+            approvalId: r.approvalId ?? null, approvalIdVerified: r.approvalIdVerified === true,
+            decisionId: r.decisionId ?? null, resolved: r.resolved === true,
+          };
           break;
         }
         case 'claude_session_inject': {

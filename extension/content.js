@@ -32,6 +32,9 @@ const SEL = {
   approvalTitle: '[data-approval-value]',
   approvalDigit: '[data-approval-digit]',
   approvalSent:  'ul[aria-label="What Claude sent"] > li',
+  // AskUserQuestion card (same root as above; see readApprovalCard for the shape).
+  questionOther:   'textarea[aria-label="Other option"]',
+  questionDismiss: 'button[aria-label="Dismiss question"]',
 };
 
 function sessionIdFromKey(rowKey) {
@@ -492,18 +495,65 @@ function branchBarSig(bb) {
   return [bb.featureBranch, bb.repo, bb.prNumber, bb.additions, bb.deletions].join('|');
 }
 
-// The pending tool-permission card, or null. Document-global like the branch
-// bar, so callers must only trust this once the tab is proven parked on the
-// session (see approvalCardFresh).
+// ── Pending cards: tool-permission and AskUserQuestion ──────────────────────────
 //
-// Returns { title, action, fields, options, el }:
-//   action  — "use send later (Claude Code Remote)", from "Allow Claude to …?"
-//   fields  — what Claude sent, [{ label, value }]
-//   options — every numbered button on the card, [{ digit, label }]
+// Both kinds render under the same [data-approval-card-root], but their insides
+// differ (both confirmed live, 2026-09-25 and 2026-09-28):
+//
+//   permission — title "[data-approval-value]" reads "Allow Claude to …?", the
+//                "What Claude sent" list holds the tool input, and each button
+//                is numbered by a [data-approval-digit] span (1="Deny",
+//                2="Allow once", …). Clicking a button answers immediately.
+//   question   — no title span, no digit spans. The question text sits in a
+//                span; each option is a <button> holding <kbd>N</kbd>, a label
+//                div and a description div; a trailing "Other" button (digit
+//                N+1) reveals a textarea[aria-label="Other option"]; "Skip" and
+//                "Submit" buttons follow (Submit disabled until a pick). The
+//                header row has "View question options" / "Dismiss question"
+//                icon buttons. Clicking an option SELECTS it; Submit sends.
+//
+// Which one it is comes from React, not the DOM: page-bridge.js (MAIN world)
+// reads the card component's `pendingApproval.tool` and tool.name is
+// "AskUserQuestion" for a question, any other tool for a permission. The DOM
+// shape is the fallback when that lookup fails.
+
+// Ask the MAIN-world half (page-bridge.js) for React's view of the pending
+// card. Synchronous: dispatchEvent runs the MAIN listener inline and it replies
+// with a JSON string (objects do not cross worlds, strings do). null when there
+// is no card, the helper is not loaded, or React props could not be found.
+function readApprovalMeta() {
+  let payload = null;
+  const onReply = (e) => { payload = e.detail; };
+  window.addEventListener('claude-bridge:approval-meta', onReply);
+  try { window.dispatchEvent(new CustomEvent('claude-bridge:read-approval')); }
+  finally { window.removeEventListener('claude-bridge:approval-meta', onReply); }
+  if (typeof payload !== 'string') return null;
+  try {
+    const meta = JSON.parse(payload);
+    return meta && typeof meta === 'object' && meta.tool ? meta : null;
+  } catch { return null; }
+}
+
+// The pending card, or null. Document-global like the branch bar, so callers
+// must only trust this once the tab is proven parked on the session (see
+// approvalCardFresh).
+//
+// Returns { kind, id, meta, title, action, fields, options, question, text,
+//           controls, el }:
+//   kind     — 'permission' | 'question' | 'unknown'
+//   id       — the tool_use id Claude is blocked on (stable for the card's life)
+//   action   — permission: "use send later (Claude Code Remote)", from the title
+//   fields   — permission: what Claude sent, [{ label, value }]
+//   options  — [{ digit, label, description?, button }]; for a question these are
+//              Claude's options exactly as it presented them (label/description
+//              from the tool input), paired to the on-screen buttons by position
+//   question — question: { header, question, multiSelect, questionCount, freeText }
+//   controls — question: { other, textarea, submit, skip } DOM handles
 function readApprovalCard() {
   const el = document.querySelector(SEL.approvalCard);
   if (!el) return null;
 
+  const meta   = readApprovalMeta();
   const title  = normText(el.querySelector(SEL.approvalTitle)?.textContent);
   const action = title.match(/^Allow Claude to (.+?)\??$/i)?.[1] ?? null;
 
@@ -512,7 +562,8 @@ function readApprovalCard() {
     value: (li.children[1]?.textContent ?? '').trim(),
   }));
 
-  const options = [...el.querySelectorAll(SEL.approvalDigit)]
+  // Permission-card buttons, numbered by their data-approval-digit span.
+  const permOptions = [...el.querySelectorAll(SEL.approvalDigit)]
     .map(span => ({
       digit:  Number(span.getAttribute('data-approval-digit')),
       label:  normText(span.textContent),
@@ -521,31 +572,84 @@ function readApprovalCard() {
     .filter(o => o.button)
     .sort((a, b) => a.digit - b.digit);
 
-  // The card's whole visible text, minus the buttons. `title` and `fields` rely
-  // on selectors matching the permission card; a different kind of card (a
-  // question, a plan approval) may not match them, and this keeps what it says
-  // readable anyway.
+  // Question-card buttons, numbered by a <kbd> child.
+  const kbdOptions = [...el.querySelectorAll('button')]
+    .filter(b => b.querySelector('kbd') && !b.querySelector(SEL.approvalDigit))
+    .map(b => {
+      const kbd    = b.querySelector('kbd');
+      const leaves = [...b.querySelectorAll('div')].filter(d => d.childElementCount === 0);
+      const label  = normText(leaves[0]?.textContent) || normText(b.textContent.replace(kbd.textContent, ''));
+      return { digit: Number(kbd.textContent), label, description: normText(leaves[1]?.textContent) || null, button: b };
+    })
+    .filter(o => Number.isFinite(o.digit))
+    .sort((a, b) => a.digit - b.digit);
+
+  const textarea = el.querySelector(SEL.questionOther);
+  const buttons  = [...el.querySelectorAll('button')];
+  const byText   = (t) => buttons.find(b => normText(b.textContent) === t) ?? null;
+  const looksLikeQuestion = !!(textarea || el.querySelector(SEL.questionDismiss) || (kbdOptions.length && !permOptions.length));
+
+  const toolName = meta?.tool?.name ?? null;
+  const kind = toolName === 'AskUserQuestion' ? 'question'
+             : (toolName || action || permOptions.length) ? 'permission'
+             : looksLikeQuestion ? 'question'
+             : 'unknown';
+
+  let options = permOptions;
+  let question = null;
+  let controls = null;
+  if (kind === 'question') {
+    const questions = Array.isArray(meta?.tool?.input?.questions) ? meta.tool.input.questions : [];
+    const q = questions[0] ?? null;
+    const otherOpt = kbdOptions.find(o => /^other$/i.test(o.label)) ?? null;
+    const listed   = kbdOptions.filter(o => o !== otherOpt);
+    // Claude's wording wins over the (possibly truncated) rendered text; the
+    // DOM only supplies the button and its digit.
+    options = listed.map((o, i) => ({
+      digit:       o.digit,
+      label:       q?.options?.[i]?.label ?? o.label,
+      description: q?.options?.[i]?.description ?? o.description,
+      button:      o.button,
+    }));
+    question = {
+      header:        q?.header ?? null,
+      question:      q?.question ?? null,
+      multiSelect:   q?.multiSelect === true,
+      questionCount: questions.length || 1,
+      freeText:      textarea ? { digit: otherOpt?.digit ?? null } : null,
+    };
+    controls = { other: otherOpt?.button ?? null, textarea, submit: byText('Submit'), skip: byText('Skip') };
+  }
+
+  // The card's whole visible text, minus the buttons — readable whatever the
+  // layout, and the only thing a caller gets for an 'unknown' card.
   const parts = [];
   const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
   for (let n = walker.nextNode(); n; n = walker.nextNode()) {
-    if (n.parentElement?.closest('button, kbd, .sr-only, [hidden]')) continue;
+    if (n.parentElement?.closest('button, kbd, textarea, .sr-only, [hidden]')) continue;
     const t = normText(n.textContent);
     if (t) parts.push(t);
   }
   const text = parts.join(' ').replace(/ ([?.,:;!])/g, '$1');
 
-  return { title, action, fields, options, text, el };
+  return { kind, id: meta?.tool?.id ?? null, meta, title, action, fields, options, question, text, controls, el };
 }
 
-// Serialisable view of a card, for responses.
+// Serialisable view of a card, for responses. `kind` is the field FlightDesk
+// routes on; `id` lets a caller prove it is answering the card it read.
 function approvalView(card) {
   if (!card) return null;
   return {
-    title:   card.title,
-    action:  card.action,
-    fields:  card.fields,
-    options: card.options.map(({ digit, label }) => ({ digit, label })),
-    text:    card.text,
+    kind:     card.kind,
+    id:       card.id,
+    tool:     card.meta ? { id: card.meta.tool.id, name: card.meta.tool.name, input: card.meta.tool.input ?? null } : null,
+    title:    card.title,
+    action:   card.action,
+    fields:   card.fields,
+    options:  card.options.map(({ digit, label, description }) =>
+                card.kind === 'question' ? { digit, label, description: description ?? null } : { digit, label }),
+    question: card.question,
+    text:     card.text,
   };
 }
 
@@ -564,12 +668,38 @@ function approvalCardFresh(sessionId, prev, navigated) {
   return (card.el !== prev.el || approvalSig(card) !== prev.sig) ? card : null;
 }
 
-// Answer the pending permission card on `sessionId`. `choice` is either the
-// option's digit (1-based, as shown on the card) or its label, case-insensitive
-// ("Allow once", "Deny", …). `expectAction`, when given, must appear in the
-// card's action text, so a caller that read one card cannot answer a different
-// one that replaced it in the meantime.
-async function respondApproval(sessionId, choice, expectAction) {
+function cardSummary(card) {
+  return card.action ?? card.question?.question?.slice(0, 80) ?? card.title ?? card.text.slice(0, 80);
+}
+
+function findOption(card, want) {
+  const w = String(want ?? '').trim();
+  return /^\d+$/.test(w)
+    ? card.options.find(o => o.digit === Number(w))
+    : card.options.find(o => o.label.toLowerCase() === w.toLowerCase());
+}
+
+function assertClickable(opt) {
+  if (opt.button.disabled || opt.button.getAttribute('aria-disabled') === 'true') {
+    throw new Error(`Option "${opt.label}" is disabled`);
+  }
+}
+
+// Answer the pending card on `sessionId`.
+//
+//   req.choice / req.choices — option digit(s) (1-based, as on the card) or
+//                              label(s), case-insensitive. `choices` only for a
+//                              multi-select question. "skip" skips a question.
+//   req.text                 — free-text answer for a question's "Other" option.
+//   req.expectAction         — substring the card's action / question must
+//                              contain, so a caller that read one card cannot
+//                              answer a different one that replaced it.
+//   req.approvalId           — the `approval.id` the caller read; refused if the
+//                              pending card is a different one.
+//   req.decisionId           — the caller's own decision id, echoed back and
+//                              logged so the approval log can be reconciled.
+async function respondApproval(sessionId, req) {
+  const { choice, choices, text, expectAction, approvalId, decisionId } = req;
   const prevCard = readApprovalCard();
   const prev = prevCard ? { el: prevCard.el, sig: approvalSig(prevCard) } : null;
   const navigated = activeSessionId() !== sessionId || sessionIdFromUrl() !== sessionId;
@@ -582,28 +712,24 @@ async function respondApproval(sessionId, choice, expectAction) {
   await pollUntil(() => (card = approvalCardFresh(sessionId, prev, navigated)), 5000);
   if (!card) throw new Error('No pending approval card on this session');
 
-  if (expectAction && !normText(card.action ?? card.title).toLowerCase().includes(normText(expectAction).toLowerCase())) {
-    throw new Error(`Approval card is for "${card.action ?? card.title}", not "${expectAction}" — nothing clicked`);
+  if (approvalId && card.id && card.id !== approvalId) {
+    throw new Error(`Pending card is ${card.id} (${card.kind}: "${cardSummary(card)}"), not ${approvalId} — nothing clicked`);
+  }
+  if (expectAction) {
+    const hay = normText(`${card.action ?? ''} ${card.title ?? ''} ${card.question?.question ?? ''}`).toLowerCase();
+    if (!hay.includes(normText(expectAction).toLowerCase())) {
+      throw new Error(`Approval card is for "${cardSummary(card)}", not "${expectAction}" — nothing clicked`);
+    }
+  }
+  if (card.kind === 'unknown') {
+    throw new Error(`Unrecognised card layout ("${card.text.slice(0, 120)}") — nothing clicked. Answer it in the browser and send its HTML so the bridge can learn it`);
   }
 
-  const available = card.options.map(o => `${o.digit}="${o.label}"`).join(', ') || 'none';
-  if (card.options.length === 0) {
-    throw new Error(`Approval card has no numbered options — unrecognised card layout ("${card.title}"). Nothing clicked`);
-  }
-  const want = String(choice ?? '').trim();
-  const opt = /^\d+$/.test(want)
-    ? card.options.find(o => o.digit === Number(want))
-    : card.options.find(o => o.label.toLowerCase() === want.toLowerCase());
-  if (!opt) throw new Error(`No option "${want}" on the approval card (available: ${available}). Nothing clicked`);
-  if (opt.button.disabled || opt.button.getAttribute('aria-disabled') === 'true') {
-    throw new Error(`Option "${opt.label}" is disabled`);
-  }
-
-  // Clicking is irreversible; only start it if we can still report the result.
-  assertBudget('respond_approval', 8_000);
   const answeredSig = approvalSig(card);
   const answered = approvalView(card);
-  opt.button.click();
+  const applied = card.kind === 'question'
+    ? await answerQuestionCard(card, { choice, choices, text })
+    : answerPermissionCard(card, choice);
 
   // Resolved once the card is gone or has been replaced by a different one.
   const resolved = await pollUntil(() => {
@@ -611,7 +737,97 @@ async function respondApproval(sessionId, choice, expectAction) {
     return !now || approvalSig(now) !== answeredSig;
   }, 5000);
 
-  return { clicked: { digit: opt.digit, label: opt.label }, approval: answered, resolved };
+  return {
+    applied,
+    clicked: applied.clicked,          // back-compat: first/only option clicked
+    approval: answered,
+    approvalId: card.id,
+    approvalIdVerified: !!(approvalId && card.id),
+    decisionId: decisionId ?? null,
+    resolved,
+  };
+}
+
+// Permission card: one click on a numbered button answers it.
+function answerPermissionCard(card, choice) {
+  const available = card.options.map(o => `${o.digit}="${o.label}"`).join(', ') || 'none';
+  if (card.options.length === 0) {
+    throw new Error(`Approval card has no numbered options — unrecognised card layout ("${card.title}"). Nothing clicked`);
+  }
+  const opt = findOption(card, choice);
+  if (!opt) throw new Error(`No option "${String(choice ?? '').trim()}" on the approval card (available: ${available}). Nothing clicked`);
+  assertClickable(opt);
+
+  // Clicking is irreversible; only start it if we can still report the result.
+  assertBudget('respond_approval', 8_000);
+  opt.button.click();
+  return { kind: 'permission', clicked: { digit: opt.digit, label: opt.label }, digits: [opt.digit], labels: [opt.label], text: null };
+}
+
+// Question card: clicking an option only selects it (Submit stays disabled
+// until something is picked, confirmed live 2026-09-28), so pick, then Submit.
+// If the card vanishes after the pick — a layout that auto-submits — that
+// counts as done. Free text goes through the "Other" option's textarea.
+async function answerQuestionCard(card, { choice, choices, text }) {
+  const c = card.controls;
+  const wants = (Array.isArray(choices) && choices.length ? choices : [choice])
+    .filter(v => v != null && String(v).trim() !== '');
+  const available = card.options.map(o => `${o.digit}="${o.label}"`).join(', ') || 'none';
+  const freeText = typeof text === 'string' && text.trim() ? text : null;
+
+  if (!freeText && wants.length === 0) throw new Error(`Question card needs choice, choices, or text (options: ${available}). Nothing clicked`);
+  if (wants.length > 1 && !card.question?.multiSelect) throw new Error('This question is single-select — pass one choice. Nothing clicked');
+  if (freeText && !c.textarea) throw new Error(`This question has no free-text option (options: ${available}). Nothing clicked`);
+
+  if (!freeText && wants.length === 1 && /^skip$/i.test(String(wants[0]))) {
+    if (!c.skip) throw new Error('No Skip button on this question card. Nothing clicked');
+    assertBudget('respond_approval', 8_000);
+    c.skip.click();
+    return { kind: 'question', clicked: { digit: null, label: 'Skip' }, digits: [], labels: ['Skip'], text: null };
+  }
+
+  const picked = wants.map(w => {
+    const opt = findOption(card, w);
+    if (!opt) throw new Error(`No option "${String(w).trim()}" on the question card (available: ${available}). Nothing clicked`);
+    assertClickable(opt);
+    return opt;
+  });
+
+  // Selecting + typing + Submit is a multi-step irreversible act; budget it all.
+  assertBudget('respond_approval', 10_000);
+  const sig  = approvalSig(card);
+  const gone = () => { const now = readApprovalCard(); return !now || approvalSig(now) !== sig; };
+
+  for (const opt of picked) {
+    opt.button.click();
+    await pollUntil(() => gone() || opt.button.getAttribute('aria-pressed') === 'true' || opt.button.getAttribute('aria-checked') === 'true' || (c.submit && !c.submit.disabled), 1500);
+  }
+
+  if (freeText) {
+    if (c.other) c.other.click();
+    await pollUntil(() => gone() || c.textarea.getBoundingClientRect().height > 0, 1500);
+    if (!gone()) {
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+      c.textarea.focus();
+      setter.call(c.textarea, freeText);
+      c.textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+  }
+
+  await pollUntil(() => gone() || (c.submit && !c.submit.disabled), 3000);
+  if (!gone()) {
+    if (!c.submit) throw new Error('Selection made but the card has no Submit button — nothing submitted');
+    if (c.submit.disabled) throw new Error('Selection made but Submit stayed disabled — nothing submitted; the card may still show the selection');
+    c.submit.click();
+  }
+
+  return {
+    kind:    'question',
+    clicked: picked[0] ? { digit: picked[0].digit, label: picked[0].label } : (freeText ? { digit: card.question?.freeText?.digit ?? null, label: 'Other' } : null),
+    digits:  picked.map(o => o.digit),
+    labels:  picked.map(o => o.label),
+    text:    freeText,
+  };
 }
 
 function findSendButton() {
@@ -1790,7 +2006,7 @@ chrome.runtime.onMessage.addListener((msg) => {
           // the API said (or if it could not be reached) — the two signals are
           // OR'd so a blocked session is flagged if either one sees it.
           const finalState = scraped.approval && gsState !== 'archived' ? 'awaiting_approval' : gsState;
-          relayLog(`get_state ${msg.sessionId}: state=${finalState} (worker=${gsMeta?.workerStatus ?? 'n/a'} bucket=${gsMeta?.statusBucket ?? 'n/a'}) branch=${scraped.branchBar?.featureBranch ?? 'none'} usagePct=${scraped.usagePct ?? 'n/a'} approval=${scraped.approval?.action ?? 'none'}`);
+          relayLog(`get_state ${msg.sessionId}: state=${finalState} (worker=${gsMeta?.workerStatus ?? 'n/a'} bucket=${gsMeta?.statusBucket ?? 'n/a'}) branch=${scraped.branchBar?.featureBranch ?? 'none'} usagePct=${scraped.usagePct ?? 'n/a'} approval=${scraped.approval ? `${scraped.approval.kind}:${scraped.approval.action ?? scraped.approval.question?.header ?? scraped.approval.id ?? '?'}` : 'none'}`);
           respond(requestId, {
             ok: true,
             state: finalState,
@@ -1807,8 +2023,11 @@ chrome.runtime.onMessage.addListener((msg) => {
         }
 
         case 'respond_approval': {
-          const r = await withNavLock(() => respondApproval(msg.sessionId, msg.choice, msg.expectAction));
-          relayLog(`respond_approval ${msg.sessionId}: clicked ${r.clicked.digit}="${r.clicked.label}" on "${r.approval.action ?? r.approval.title}" resolved=${r.resolved}`);
+          const r = await withNavLock(() => respondApproval(msg.sessionId, {
+            choice: msg.choice, choices: msg.choices, text: msg.text,
+            expectAction: msg.expectAction, approvalId: msg.approvalId, decisionId: msg.decisionId,
+          }));
+          relayLog(`respond_approval ${msg.sessionId}: ${r.approval.kind} ${r.approvalId ?? 'no-id'} applied ${JSON.stringify(r.applied.digits)}=${JSON.stringify(r.applied.labels)}${r.applied.text ? ' +text' : ''} decision=${r.decisionId ?? 'none'} on "${r.approval.action ?? r.approval.question?.question?.slice(0, 60) ?? r.approval.title}" resolved=${r.resolved}`);
           respond(requestId, { ok: true, ...r });
           break;
         }

@@ -194,6 +194,9 @@ async function onDaemonMessage(msg) {
           await chrome.tabs.update(tab.id, { active: true });
           await new Promise(r => setTimeout(r, 3500));
         } else {
+          // page-bridge.js is content.js's MAIN-world half (React props reader);
+          // re-inject both so readApprovalMeta() has someone to answer it.
+          await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['page-bridge.js'], world: 'MAIN' });
           await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
         }
         await chrome.tabs.sendMessage(tab.id, { requestId, cmd, sessionId, ...params });
