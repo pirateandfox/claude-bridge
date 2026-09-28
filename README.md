@@ -33,7 +33,7 @@ claude.ai session
 | Tool | Description |
 |------|-------------|
 | `claude_sessions_list` | List all sessions visible in the sidebar |
-| `claude_session_get_state` | Get state, branch info, CI status, model, usage %, and any pending card (`approval.kind`: `permission`, `question`, or `unknown`) |
+| `claude_session_get_state` | Get state, branch info, CI status, model, usage %, any pending card (`approval.kind`: `permission`, `question`, or `unknown`), and `resolvedApprovals` — recent card resolutions from the session event stream, including ones answered in the claude.ai UI (`source: "ui"`) or through the bridge (`source: "bridge"` with the caller's `decisionId`) |
 | `claude_session_respond_approval` | Answer a pending permission card (option digit/label) or question card (option, several options, free text, or skip); accepts `approval_id` and `decision_id` for reconciliation |
 | `claude_session_inject` | Submit a prompt to a session |
 | `claude_session_create_preflight` | Verify the create path can reach a blank Code composer without creating a session |

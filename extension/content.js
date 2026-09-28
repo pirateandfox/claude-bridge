@@ -516,7 +516,7 @@ function branchBarSig(bb) {
 //                options" / "Dismiss question" icon buttons. Clicking an option
 //                SELECTS it (toggles, for multi-select); Submit/Next sends.
 //                A multi-question card keeps the same tool id across its pages;
-//                `question.index` tells them apart.
+//                `question.index` (0-based) tells them apart.
 //
 // Which one it is comes from React, not the DOM: page-bridge.js (MAIN world)
 // reads the card component's `pendingApproval.tool` and tool.name is
@@ -626,8 +626,8 @@ function readApprovalCard() {
     const questions = Array.isArray(meta?.tool?.input?.questions) ? meta.tool.input.questions : [];
     // "1 / 3" pager when the tool asked several questions; absent for one.
     const pager = text_pager(el);
-    const index = pager?.index ?? 1;
-    const q = questions[index - 1] ?? questions[0] ?? null;
+    const index = (pager?.index ?? 1) - 1;   // 0-based; the card shows index+1 / questionCount
+    const q = questions[index] ?? questions[0] ?? null;
     const otherOpt = kbdOptions.find(o => /^other$/i.test(o.label)) ?? null;
     const listed   = kbdOptions.filter(o => o !== otherOpt);
     // Claude's wording wins over the (possibly truncated) rendered text; the
@@ -1651,6 +1651,172 @@ async function readTranscript(sessionId, lastN) {
   return turns;
 }
 
+const EVENTS_HEADERS = {
+  'anthropic-beta':    'managed-agents-2026-04-01',
+  'anthropic-version': '2023-06-01',
+};
+
+function kindForTool(toolName) {
+  if (toolName === 'AskUserQuestion') return 'question';
+  return toolName ? 'permission' : 'unknown';
+}
+
+// ── Resolved approvals ──────────────────────────────────────────────────────────
+//
+// Read off the session's event stream, NOT the DOM, so it sees answers given
+// anywhere: this bridge, a click in the claude.ai UI, another browser, a phone.
+// The permission handshake in the stream (confirmed 2026-09-28):
+//
+//   control_request  (source "worker")  payload.request = { subtype:
+//       "can_use_tool", tool_name, display_name, tool_use_id, input, mcp_server? }
+//   control_response (source "client")  payload.response = { request_id,
+//       subtype: "success", response: { behavior: "allow"|"deny", toolUseID,
+//       tool_name, updatedInput?, message? } }
+//   control_cancel_request (source "worker")  payload = { request_id } —
+//       the worker withdrew the card (turn interrupted, session ended).
+//
+// AskUserQuestion answers travel in updatedInput.answers keyed by the QUESTION
+// TEXT (not the header): a label string for single-select, an array of labels
+// for multi-select, free text as typed (confirmed live 2026-09-28). One entry is
+// emitted per question so a two-question card is two entries under one
+// approvalId.
+//
+// Pages are newest-first. `since` is a sequence_num cursor: paging stops once a
+// page dips below it, and only entries above it are returned. Without a cursor
+// at most `maxPages` pages are read and `truncated` says whether older history
+// was left unread.
+async function readResolvedApprovals(sessionId, { since = null, limit = 20, maxPages = 3 } = {}) {
+  const cseId = sessionId.replace(/^session_/, 'cse_');
+  const requests  = new Map();
+  const responses = new Map();
+  const cancels   = new Map();
+  let cursor = null, pages = 0, maxSeq = null, truncated = false;
+
+  while (pages < maxPages) {
+    const params = new URLSearchParams({ limit: 200 });
+    if (cursor) params.set('cursor', cursor);
+    const resp = await fetchWithTimeout(`/v1/code/sessions/${cseId}/events?${params}`,
+      { credentials: 'include', headers: EVENTS_HEADERS }, 10000);
+    if (!resp.ok) throw new Error(`Events API ${resp.status}`);
+    const data = await resp.json();
+    pages++;
+
+    let belowCursor = false;
+    for (const ev of (data.data ?? [])) {
+      const seq = Number(ev.sequence_num);
+      if (Number.isFinite(seq)) {
+        maxSeq = maxSeq === null ? seq : Math.max(maxSeq, seq);
+        if (since !== null && seq <= since) belowCursor = true;
+      }
+      const p = ev.payload ?? {};
+      if (ev.event_type === 'control_request' && p.request?.subtype === 'can_use_tool' && p.request_id) requests.set(p.request_id, ev);
+      else if (ev.event_type === 'control_response' && p.response?.request_id) responses.set(p.response.request_id, ev);
+      else if (ev.event_type === 'control_cancel_request' && p.request_id) cancels.set(p.request_id, ev);
+    }
+    if (belowCursor || !data.next_cursor) break;
+    cursor = data.next_cursor;
+  }
+  if (pages >= maxPages && cursor && since === null) truncated = true;
+
+  const entries = [];
+  const optionLabels = (q) => (q.options ?? []).map(o => String(o.label ?? ''));
+
+  for (const [rid, ev] of responses) {
+    const req = requests.get(rid);
+    const r = ev.payload?.response?.response ?? {};
+    const toolName  = req?.payload?.request?.tool_name ?? r.tool_name ?? null;
+    const toolUseId = req?.payload?.request?.tool_use_id ?? r.toolUseID ?? null;
+    if (!toolName && !toolUseId) continue;               // not a permission handshake
+    const base = {
+      approvalId:  toolUseId,
+      kind:        kindForTool(toolName),
+      toolName,
+      requestId:   rid,
+      behavior:    r.behavior ?? null,
+      requestedAt: req?.created_at ?? null,
+      resolvedAt:  ev.created_at ?? null,
+      seq:         Number(ev.sequence_num),
+    };
+
+    if (toolName === 'AskUserQuestion') {
+      const questions = req?.payload?.request?.input?.questions ?? r.updatedInput?.questions ?? [];
+      const answers   = r.updatedInput?.answers ?? r.answers ?? {};
+      if (!questions.length) {
+        const labels = Object.values(answers).map(v => String(v));
+        entries.push({ ...base, questionIndex: 0, questionCount: 1, applied: { digits: [], labels, text: null }, ...(labels.length ? {} : { skipped: true }) });
+        continue;
+      }
+      questions.forEach((q, i) => {
+        const raw = answers[q.question] ?? answers[q.header];
+        const labels = optionLabels(q);
+        const given = (Array.isArray(raw) ? raw : (raw == null ? [] : [raw]))
+          .map(v => String(v)).filter(v => v.trim());
+        const picked = labels.filter(l => given.includes(l));
+        const rest   = given.filter(v => !picked.includes(v));
+        const text   = rest.length ? rest.join(', ') : null;
+        const skipped = picked.length === 0 && !text;
+        entries.push({
+          ...base,
+          questionIndex: i,
+          questionCount: questions.length,
+          header:        q.header ?? null,
+          applied:       { digits: picked.map(l => labels.indexOf(l) + 1), labels: picked, text },
+          ...(skipped ? { skipped: true } : {}),
+        });
+      });
+    } else {
+      const allow = r.behavior === 'allow';
+      entries.push({
+        ...base,
+        questionIndex: 0,
+        questionCount: 1,
+        applied: { digits: [], labels: [allow ? 'Allow' : 'Deny'], text: null },
+        ...(r.behavior === 'deny' && r.message ? { message: String(r.message).slice(0, 200) } : {}),
+      });
+    }
+  }
+
+  for (const [rid, ev] of cancels) {
+    if (responses.has(rid)) continue;
+    const req = requests.get(rid);
+    if (!req) continue;
+    const toolName = req.payload?.request?.tool_name ?? null;
+    entries.push({
+      approvalId:    req.payload?.request?.tool_use_id ?? null,
+      kind:          kindForTool(toolName),
+      toolName,
+      requestId:     rid,
+      behavior:      'cancelled',
+      requestedAt:   req.created_at ?? null,
+      resolvedAt:    ev.created_at ?? null,
+      seq:           Number(ev.sequence_num),
+      questionIndex: 0,
+      questionCount: req.payload?.request?.input?.questions?.length ?? 1,
+      applied:       { digits: [], labels: [], text: null },
+      skipped:       true,
+    });
+  }
+
+  entries.sort((a, b) => (b.seq - a.seq) || (b.questionIndex - a.questionIndex));
+  const kept = (since !== null ? entries.filter(e => e.seq > since) : entries).slice(0, limit);
+  return { entries: kept, cursor: maxSeq, truncated };
+}
+
+// get_state must not fail because history could not be read; report the error
+// in-band instead.
+async function resolvedApprovalsSafe(msg) {
+  try {
+    const r = await readResolvedApprovals(msg.sessionId, {
+      since: Number.isFinite(Number(msg.resolvedSince)) && msg.resolvedSince !== null && msg.resolvedSince !== undefined ? Number(msg.resolvedSince) : null,
+      limit: Number.isFinite(Number(msg.resolvedLimit)) && msg.resolvedLimit ? Math.min(100, Math.max(1, Number(msg.resolvedLimit))) : 20,
+    });
+    return { resolvedApprovals: r.entries, resolvedApprovalsCursor: r.cursor, resolvedApprovalsTruncated: r.truncated };
+  } catch (e) {
+    relayLog(`get_state ${msg.sessionId}: resolved approvals unavailable (${e.message})`);
+    return { resolvedApprovals: null, resolvedApprovalsCursor: null, resolvedApprovalsTruncated: false, resolvedApprovalsError: e.message };
+  }
+}
+
 // Newest user turn for `sessionId`, read straight off the session-keyed events
 // API. DOM-INDEPENDENT ON PURPOSE: this is the channel used to PROVE that an
 // injected prompt landed in the session we asked for, so it must not be able to
@@ -1963,7 +2129,9 @@ chrome.runtime.onMessage.addListener((msg) => {
             const meta = await readSessionMeta(msg.sessionId);
             if (!meta) { respond(requestId, { ok: false, error: 'Session not found' }); break; }
             relayLog(`get_state ${msg.sessionId}: no sidebar row (archived?) — metadata only (worker=${meta.workerStatus ?? 'n/a'} bucket=${meta.statusBucket ?? 'n/a'})`);
+            const resolvedArchived = await resolvedApprovalsSafe(msg);
             respond(requestId, {
+              ...resolvedArchived,
               ok: true,
               state:        deriveSessionState(meta, 'unknown'),
               needsHuman:   deriveSessionState(meta, 'unknown') === 'awaiting_approval',
@@ -1989,6 +2157,9 @@ chrome.runtime.onMessage.addListener((msg) => {
           // up front: it decides whether to wait for an approval card below.
           const gsMeta  = await readSessionMeta(msg.sessionId);
           const gsState = deriveSessionState(gsMeta, readRowState(row));
+          // DOM-independent, so it runs alongside the scrape rather than inside
+          // the nav lock.
+          const resolvedP = resolvedApprovalsSafe(msg);
 
           const scraped = await withNavLock(async () => {
             const onSession = activeSessionId() === msg.sessionId
@@ -2049,6 +2220,7 @@ chrome.runtime.onMessage.addListener((msg) => {
           // the API said (or if it could not be reached) — the two signals are
           // OR'd so a blocked session is flagged if either one sees it.
           const finalState = scraped.approval && gsState !== 'archived' ? 'awaiting_approval' : gsState;
+          const resolved = await resolvedP;
           relayLog(`get_state ${msg.sessionId}: state=${finalState} (worker=${gsMeta?.workerStatus ?? 'n/a'} bucket=${gsMeta?.statusBucket ?? 'n/a'}) branch=${scraped.branchBar?.featureBranch ?? 'none'} usagePct=${scraped.usagePct ?? 'n/a'} approval=${scraped.approval ? `${scraped.approval.kind}:${scraped.approval.action ?? scraped.approval.question?.header ?? scraped.approval.id ?? '?'}` : 'none'}`);
           respond(requestId, {
             ok: true,
@@ -2061,6 +2233,7 @@ chrome.runtime.onMessage.addListener((msg) => {
             effort:    scraped.effort,
             usagePct:  scraped.usagePct,
             approval:  scraped.approval,
+            ...resolved,
           });
           break;
         }

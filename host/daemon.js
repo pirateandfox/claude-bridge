@@ -2,7 +2,7 @@
 // Always-running daemon: MCP Streamable-HTTP server (port 7878) + Unix socket for native-host relay
 
 import { createServer as createNetServer } from 'net';
-import { unlinkSync, existsSync, readdirSync } from 'fs';
+import { unlinkSync, existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { homedir }                          from 'os';
 import { join }                             from 'path';
 import express                              from 'express';
@@ -168,6 +168,51 @@ const queue           = [];
 // URL. That legitimately exceeded 60s on 2026-08-08 — the session was created
 // correctly but the caller got a timeout error, which is the worst outcome:
 // a retry would create a SECOND session for the same task.
+// ── Decision log ───────────────────────────────────────────────────────────────
+// Every answer the bridge applies through respond_approval, keyed by session +
+// approvalId (+ question page). get_state merges it into the event-derived
+// resolvedApprovals so a caller can tell its own decisions (source "bridge",
+// with the decisionId it passed) from answers given in the claude.ai UI
+// (source "ui"). Persisted so it survives daemon restarts; capped in length.
+const STATE_DIR      = join(homedir(), '.claude-bridge');
+const DECISIONS_PATH = join(STATE_DIR, 'decisions.json');
+const DECISIONS_MAX  = 2000;
+let decisions = [];
+try {
+  const parsed = JSON.parse(readFileSync(DECISIONS_PATH, 'utf8'));
+  if (Array.isArray(parsed)) decisions = parsed;
+} catch { /* first run, or unreadable: start empty */ }
+
+function recordDecision(d) {
+  decisions.push(d);
+  if (decisions.length > DECISIONS_MAX) decisions = decisions.slice(-DECISIONS_MAX);
+  try {
+    mkdirSync(STATE_DIR, { recursive: true });
+    writeFileSync(DECISIONS_PATH, JSON.stringify(decisions));
+  } catch (e) {
+    log(`decision log write failed (${e.message}) — history will not survive a restart`);
+  }
+}
+
+function findDecision(sessionId, approvalId, questionIndex) {
+  for (let i = decisions.length - 1; i >= 0; i--) {
+    const d = decisions[i];
+    if (d.sessionId === sessionId && d.approvalId === approvalId && (d.questionIndex ?? 0) === (questionIndex ?? 0)) return d;
+  }
+  return null;
+}
+
+// Attach source / decisionId to each event-derived resolution.
+function mergeDecisions(sessionId, entries) {
+  if (!Array.isArray(entries)) return entries;
+  return entries.map(e => {
+    const d = e.approvalId ? findDecision(sessionId, e.approvalId, e.questionIndex) : null;
+    if (!d) return { ...e, source: 'ui', decisionId: null };
+    const applied = e.applied && (e.applied.labels?.length || e.applied.text) ? e.applied : d.applied;
+    return { ...e, source: 'bridge', decisionId: d.decisionId ?? null, applied, bridgeApplied: d.applied, bridgeRespondedAt: d.at };
+  });
+}
+
 const TIMEOUTS = {
   inject: 60_000,
   get_state: 60_000,
@@ -379,11 +424,13 @@ const TOOLS = [
   },
   {
     name: 'claude_session_get_state',
-    description: 'Get detailed state for a specific session. `state` (running/ready/awaiting_approval/archived/unknown) now comes from the API, so it is reliable without warming — "running" means the session is actually working, "awaiting_approval" means it is blocked on a tool-permission card (workerStatus "requires_action") and will not proceed until someone answers it; the session is flagged if EITHER the API reports it or a card is showing on the page. needsHuman is true in exactly that case: stop and get a person to answer. `approval` then describes the card. `approval.kind` says what it is: "permission" (Claude asking to use a tool / run a command — `action` is "use X" from the "Allow Claude to …?" title, `fields` is what Claude sent, `options` is [{digit, label}] e.g. 1="Deny", 2="Allow once"), "question" (Claude asking the user to choose or answer via AskUserQuestion — `question` is { header, question, multiSelect, questionCount, freeText }, `options` is [{digit, label, description}] exactly as Claude presented them, and freeText non-null means an "Other" free-text answer is accepted; when Claude asked several questions at once the card pages through them — `question.index` of `questionCount` — under the SAME approval.id, so answer, re-read get_state, and answer the next; `question.selected` lists digits already picked), or "unknown" (layout not recognised — `text`, the card\'s full visible text, is always present so a person can still read it). `approval.id` is the tool_use id Claude is blocked on: stable for the card\'s life, pass it back as approval_id when answering so the bridge refuses if a different card has replaced it. `approval.tool` is { id, name, input } — the raw tool call (input strings capped). approval is null only if no card could be read at all. claude_session_respond_approval answers it. "unknown" means neither the API nor the DOM could answer and must be treated as busy, never as idle. Also returns workerStatus (idle|… — the raw busy signal; this one is reliable) and statusBucket (review_ready|blocked|completed|failed). WARNING: statusBucket semantics are UNVERIFIED — do NOT route work on it. It is passed through raw for observation only. Ruled out on 2026-08-03: it is not "PR merged" (two blocked sessions had open PRs), not derived from PR state (an open+conflicting PR appeared in both buckets), and not "ended asking a human" (a blocked session asked nothing; a review_ready one asked). A merged, finished session still reads "blocked", so it does not clear on completion and cannot mean "needs attention". branchBar/prUrl/model/effort are still scraped from the UI and are null until the session has been warmed — that reads as "no PR" rather than "not loaded", so call claude_sessions_warm before a batch read if you need branch data. usagePct is the ACCOUNT plan meter, global and identical for every session.',
+    description: 'Get detailed state for a specific session. `state` (running/ready/awaiting_approval/archived/unknown) now comes from the API, so it is reliable without warming — "running" means the session is actually working, "awaiting_approval" means it is blocked on a tool-permission card (workerStatus "requires_action") and will not proceed until someone answers it; the session is flagged if EITHER the API reports it or a card is showing on the page. needsHuman is true in exactly that case: stop and get a person to answer. `approval` then describes the card. `approval.kind` says what it is: "permission" (Claude asking to use a tool / run a command — `action` is "use X" from the "Allow Claude to …?" title, `fields` is what Claude sent, `options` is [{digit, label}] e.g. 1="Deny", 2="Allow once"), "question" (Claude asking the user to choose or answer via AskUserQuestion — `question` is { header, question, multiSelect, questionCount, freeText }, `options` is [{digit, label, description}] exactly as Claude presented them, and freeText non-null means an "Other" free-text answer is accepted; when Claude asked several questions at once the card pages through them — `question.index` of `questionCount` — under the SAME approval.id, so answer, re-read get_state, and answer the next; `question.selected` lists digits already picked), or "unknown" (layout not recognised — `text`, the card\'s full visible text, is always present so a person can still read it). `approval.id` is the tool_use id Claude is blocked on: stable for the card\'s life, pass it back as approval_id when answering so the bridge refuses if a different card has replaced it. `approval.tool` is { id, name, input } — the raw tool call (input strings capped). approval is null only if no card could be read at all. claude_session_respond_approval answers it. `resolvedApprovals` is the session\'s recent approval history, newest first, read from the session event stream so it includes cards answered in the claude.ai UI, not just through this bridge: each entry is { approvalId (same id the card had), kind, toolName, questionIndex (0-based) / questionCount (one entry per page of a multi-question card, all under one approvalId), header, behavior ("allow"|"deny"|"cancelled"), applied: {digits, labels, text} (for permissions labels is ["Allow"] or ["Deny"]), skipped: true when nothing was chosen or the card was withdrawn, source: "bridge" (answered via claude_session_respond_approval — decisionId is the one that call was given, bridgeApplied is what it pressed) or "ui" (answered directly in Claude — decisionId null), requestedAt, resolvedAt, seq }. resolvedApprovalsCursor is the newest event sequence seen: pass it back as resolved_since to get only newer entries; entries persist in the stream, so re-reads without a cursor return the same history. resolvedApprovalsTruncated true means older history exists beyond the pages scanned. resolvedApprovals is null with resolvedApprovalsError set when the event stream could not be read. "unknown" means neither the API nor the DOM could answer and must be treated as busy, never as idle. Also returns workerStatus (idle|… — the raw busy signal; this one is reliable) and statusBucket (review_ready|blocked|completed|failed). WARNING: statusBucket semantics are UNVERIFIED — do NOT route work on it. It is passed through raw for observation only. Ruled out on 2026-08-03: it is not "PR merged" (two blocked sessions had open PRs), not derived from PR state (an open+conflicting PR appeared in both buckets), and not "ended asking a human" (a blocked session asked nothing; a review_ready one asked). A merged, finished session still reads "blocked", so it does not clear on completion and cannot mean "needs attention". branchBar/prUrl/model/effort are still scraped from the UI and are null until the session has been warmed — that reads as "no PR" rather than "not loaded", so call claude_sessions_warm before a batch read if you need branch data. usagePct is the ACCOUNT plan meter, global and identical for every session.',
     inputSchema: {
       type: 'object',
       properties: {
-        session_id: { type: 'string', description: 'Session ID from claude_sessions_list' },
+        session_id:     { type: 'string', description: 'Session ID from claude_sessions_list' },
+        resolved_since: { type: 'number', description: 'Only return resolvedApprovals newer than this cursor (the resolvedApprovalsCursor from an earlier read). Omit for the most recent ones.' },
+        resolved_limit: { type: 'number', description: 'Max resolvedApprovals entries (default 20, max 100)' },
       },
       required: ['session_id'],
     },
@@ -518,8 +565,16 @@ function createMcpServer() {
           break;
         }
         case 'claude_session_get_state': {
-          const r = await sendToChrome('get_state', { sessionId: args.session_id });
-          result  = { state: r.state, needsHuman: r.needsHuman === true, statusBucket: r.statusBucket ?? null, workerStatus: r.workerStatus ?? null, branchBar: r.branchBar, prUrl: r.branchBar?.prUrl ?? null, model: r.model, effort: r.effort, usagePct: r.usagePct, approval: r.approval ?? null };
+          const r = await sendToChrome('get_state', { sessionId: args.session_id, resolvedSince: args.resolved_since ?? null, resolvedLimit: args.resolved_limit ?? null });
+          result  = {
+            state: r.state, needsHuman: r.needsHuman === true, statusBucket: r.statusBucket ?? null, workerStatus: r.workerStatus ?? null,
+            branchBar: r.branchBar, prUrl: r.branchBar?.prUrl ?? null, model: r.model, effort: r.effort, usagePct: r.usagePct,
+            approval: r.approval ?? null,
+            resolvedApprovals: mergeDecisions(args.session_id, r.resolvedApprovals ?? null),
+            resolvedApprovalsCursor: r.resolvedApprovalsCursor ?? null,
+            resolvedApprovalsTruncated: r.resolvedApprovalsTruncated === true,
+            ...(r.resolvedApprovalsError ? { resolvedApprovalsError: r.resolvedApprovalsError } : {}),
+          };
           break;
         }
         case 'claude_session_respond_approval': {
@@ -532,6 +587,11 @@ function createMcpServer() {
             approvalId: r.approvalId ?? null, approvalIdVerified: r.approvalIdVerified === true,
             decisionId: r.decisionId ?? null, resolved: r.resolved === true,
           };
+          recordDecision({
+            sessionId: args.session_id, approvalId: r.approvalId ?? null, kind: r.approval?.kind ?? null,
+            questionIndex: r.approval?.question?.index ?? 0, questionCount: r.approval?.question?.questionCount ?? 1,
+            decisionId: r.decisionId ?? null, applied: r.applied ?? null, resolved: r.resolved === true, at: new Date().toISOString(),
+          });
           break;
         }
         case 'claude_session_inject': {
