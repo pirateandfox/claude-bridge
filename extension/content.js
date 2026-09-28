@@ -684,8 +684,16 @@ function approvalView(card) {
   };
 }
 
+// Identity of a card, for "is this still the same card?" checks. Excludes
+// question.selected on purpose: toggling an option changes what is selected
+// but not which card is showing — including it made the first pick on a
+// multi-select card look like the card had resolved, so Next was never
+// pressed (2026-09-28).
 function approvalSig(card) {
-  return card ? JSON.stringify(approvalView(card)) : null;
+  if (!card) return null;
+  const view = approvalView(card);
+  if (view.question) view.question = { ...view.question, selected: undefined };
+  return JSON.stringify(view);
 }
 
 // Same identity discipline as readBranchBarFresh: after navigating, a card is
