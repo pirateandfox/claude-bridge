@@ -5,6 +5,10 @@ const SEL = {
   rowPrIcon:     '[role="img"]',      // aria-label: "Pull request open/merged/closed"
   rowMainBtn:    '[data-row-main-button]',
   rowAction:     '[data-row-action]',
+  // The sidebar renders 20 sessions per section; the rest sit behind a
+  // "Show 20 more in Recents" row (one click reveals them all, and the same
+  // button then reads "Show less in Recents"). Verified 2026-10-05.
+  showMoreBtn:   '[data-row-key^="label:showmore:"] button',
   branchBar:     '.epitaxy-branch-row',
   diffSrOnly:    '.sr-only',
   ciBtn:         'button[aria-label^="CI:"]',   // e.g. "CI: all checks passed" — semantic, survives theming
@@ -451,7 +455,8 @@ function pageDiagnostics() {
                : !onCodeApp     ? 'off_code_page'
                : !sidebarRows   ? 'sidebar_empty'
                :                  'row_not_rendered';
-  return { reason, path: location.pathname, dialogs, errorScreen, bodyText, sidebarRows, composer, visibility: document.visibilityState };
+  const showMore    = document.querySelector(SEL.showMoreBtn)?.getAttribute('aria-label') ?? null;
+  return { reason, path: location.pathname, dialogs, errorScreen, bodyText, sidebarRows, showMore, composer, visibility: document.visibilityState };
 }
 
 // The error for "there is no sidebar row for this session" — classified by
@@ -494,13 +499,41 @@ function describePage(page) {
     case 'error_screen':  return `the page is showing an error: "${page.bodyText}"`;
     case 'off_code_page': return `the tab is on ${page.path}, not the Code sessions page`;
     case 'sidebar_empty': return 'the session sidebar has not rendered any rows';
-    default:              return `the sidebar shows ${page.sidebarRows} row(s) but not this one`;
+    default:              return `the sidebar shows ${page.sidebarRows} row(s) but not this one${page.showMore ? ` ("${page.showMore}" did not reveal it)` : ', with every row shown'}`;
   }
+}
+
+function sessionRowEl(sessionId) {
+  return document.querySelector(`[data-row-key="code:${sessionId}"]`);
+}
+
+// The sidebar row for `sessionId`, expanding the sidebar's "Show N more" until
+// it is rendered, or null if it is not there once everything is shown.
+//
+// Only sessions past the first 20 are hidden this way, so without this every
+// command for an older session failed with row_not_rendered once more than 20
+// were open. Only ever clicks a "Show N more" button — never "Show less", which
+// is the same element after expanding.
+async function findSessionRow(sessionId) {
+  for (let i = 0; i < 10; i++) {
+    const row = sessionRowEl(sessionId);
+    if (row) return row;
+    const more = [...document.querySelectorAll(SEL.showMoreBtn)]
+      .find(b => /^show \d+ more\b/i.test(b.getAttribute('aria-label') ?? b.textContent.trim()));
+    if (!more) return null;
+    const before = document.querySelectorAll(SEL.sessionRow).length;
+    relayLog(`no row for ${sessionId} in ${before} rows — clicking "${more.getAttribute('aria-label')}"`);
+    more.click();
+    const grew = await pollUntil(() => sessionRowEl(sessionId)
+      || document.querySelectorAll(SEL.sessionRow).length > before, 4000);
+    if (!grew) return sessionRowEl(sessionId);
+  }
+  return sessionRowEl(sessionId);
 }
 
 // The sidebar row for `sessionId`, or a classified error explaining why not.
 async function requireSessionRow(sessionId) {
-  const row = document.querySelector(`[data-row-key="code:${sessionId}"]`);
+  const row = await findSessionRow(sessionId);
   if (row) return row;
   throw await sessionRowMissingError(sessionId);
 }
@@ -2317,7 +2350,8 @@ chrome.runtime.onMessage.addListener((msg) => {
         }
 
         case 'get_state': {
-          const row = document.querySelector(`[data-row-key="code:${msg.sessionId}"]`);
+          // Expanding the sidebar is a page change, so it runs under the nav lock.
+          const row = await withNavLock(() => findSessionRow(msg.sessionId));
           if (!row) {
             // No row to click, so the UI-scraped fields are unreachable — but
             // the API may still know the session. Archived sessions are never in

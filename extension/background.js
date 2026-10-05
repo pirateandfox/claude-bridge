@@ -288,8 +288,8 @@ function tabUnreachable(requestId, tab, err) {
 //   tab_crashed / content_unreachable — the page is dead or deaf: reload it.
 //   error_screen / sidebar_empty      — the app failed to render: reload it.
 //   dialog_open                       — a pop-up is over the app: press Escape.
-// Not recovered: row_not_rendered (the app is fine; a reload would not add the
-// row), off_code_page (routing only ever picks a Code tab now), and anything
+// Not recovered: row_not_rendered (the app is fine and content.js has already
+// expanded the sidebar's "Show N more" — a reload would not add the row), off_code_page (routing only ever picks a Code tab now), and anything
 // that is not a page problem at all (NOT_AUTHENTICATED, SESSION_NOT_FOUND…).
 function recoveryFor(response) {
   if (response.ok || response.code !== 'PAGE_UNREADABLE') return null;
