@@ -136,19 +136,38 @@ function wake(reason) {
   });
 }
 
+// Commands in flight, kept so a PAGE_UNREADABLE failure can be recovered and the
+// command sent again. requestId → { msg, startedAt, tabId, recovery }.
+// The daemon keeps one command in flight, so this holds one entry at a time.
+const inflight = new Map();
+
+// Below this much of the caller's budget, a recovery cannot finish and still
+// leave the retried command time to run, so the failure is reported as is.
+const MIN_BUDGET_FOR_RECOVERY_MS = 15_000;
+const TAB_READY_TIMEOUT_MS = 20_000;
+
+const CODE_URL = 'https://claude.ai/code';
+
 async function onDaemonMessage(msg) {
   // Liveness reply — see heartbeat(). Handled before anything else so a pong can
   // never be mistaken for a command and go looking for a tab.
   if (msg?.type === 'pong') { lastPongAt = Date.now(); return; }
 
-  const { requestId, cmd, sessionId, ...params } = msg;
+  inflight.set(msg.requestId, { msg, startedAt: Date.now(), tabId: null, recovery: null });
+  await dispatchToPage(msg.requestId);
+}
 
-  const tabs = await chrome.tabs.query({ url: 'https://claude.ai/*' });
-  if (!tabs.length) {
-    diag(`${cmd}: no claude.ai tab open (requestId=${requestId})`);
-    send({ requestId, ok: false, error: 'No claude.ai tab is open' });
-    return;
-  }
+// The caller's remaining budget for this command, or Infinity if it gave none.
+function budgetLeft(entry) {
+  return typeof entry.msg.budgetMs === 'number'
+    ? entry.msg.budgetMs - (Date.now() - entry.startedAt)
+    : Infinity;
+}
+
+async function dispatchToPage(requestId) {
+  const entry = inflight.get(requestId);
+  if (!entry) return;
+  const { cmd, sessionId, budgetMs: _budget, requestId: _rid, ...params } = entry.msg;
 
   // Prefer tabs on the Code sessions page, then active tab, then first.
   //
@@ -165,17 +184,42 @@ async function onDaemonMessage(msg) {
   // /code/artifact/… — a page with no session sidebar. An artifact open in any
   // claude.ai tab then won the selection, every row lookup missed, and get_state
   // silently degraded to API-only (2026-09-25).
+  const tabs = await chrome.tabs.query({ url: 'https://claude.ai/*' });
   const isComposer = t => /^https:\/\/claude\.ai\/code\/?(\?|#|$)/.test(t.url ?? '');
   const isCodeApp  = t => /^https:\/\/claude\.ai\/code\/?(session_[A-Za-z0-9]+\/?)?(\?|#|$)/.test(t.url ?? '');
   const needsComposer = cmd === 'create_session' || cmd === 'create_session_preflight';
   const codeTabs = tabs.filter(isCodeApp);
-  const codeTab = needsComposer
+  let tab = needsComposer
     ? (codeTabs.find(isComposer) ?? codeTabs.find(t => t.active) ?? codeTabs[0])
     : (codeTabs.find(t => t.active) ?? codeTabs[0]);
-  const tab = codeTab ?? tabs.find(t => t.active) ?? tabs[0];
+
+  if (!tab) {
+    // No Code tab. This used to borrow whichever claude.ai tab was active — a
+    // chat, settings or artifact page with no session sidebar, where every
+    // lookup failed — or give up when there was no claude.ai tab at all. Open
+    // one in the background instead: nothing the user is looking at moves.
+    diag(`${cmd}: no claude.ai/code tab (${tabs.length} claude.ai tab(s) open) — opening one (requestId=${requestId})`);
+    tab = await openCodeTab();
+    if (!tab) {
+      finish(requestId, {
+        requestId, ok: false, code: 'PAGE_UNREADABLE',
+        details: { reason: 'no_tab', recovery: { action: 'open_tab', outcome: 'failed' } },
+        error: 'No claude.ai/code tab is open and one could not be opened and loaded within ' +
+               `${TAB_READY_TIMEOUT_MS / 1000}s (signed out?) — the session was not checked`,
+      });
+      return;
+    }
+    entry.recovery ??= { action: 'open_tab', reason: 'no_tab' };
+  }
+  entry.tabId = tab.id;
   // Logs which tab a command was routed to — a login/interstitial URL here
   // explains a hung command (the in-page API fetch never authenticates).
   diag(`${cmd} → tab ${tab.id} ${tab.url} (requestId=${requestId})`);
+
+  // The page adopts this as its deadline, so hand it what is actually left —
+  // a retried command must not believe it has the whole budget again.
+  const left = budgetLeft(entry);
+  const pageMsg = { requestId, cmd, sessionId, ...params, ...(Number.isFinite(left) ? { budgetMs: left } : {}) };
 
   try {
     // Pass requestId so content script responds via chrome.runtime.sendMessage
@@ -183,7 +227,7 @@ async function onDaemonMessage(msg) {
     // in MV3 — the service worker can lose the message channel).
     // sendMessage resolves with undefined immediately; the real response
     // arrives via the onMessage listener below.
-    await chrome.tabs.sendMessage(tab.id, { requestId, cmd, sessionId, ...params });
+    await chrome.tabs.sendMessage(tab.id, pageMsg);
   } catch (err) {
     if (err.message?.toLowerCase().includes('receiving end does not exist')) {
       diag(`${cmd}: content script not reachable on tab ${tab.id}, re-injecting (requestId=${requestId})`);
@@ -199,14 +243,166 @@ async function onDaemonMessage(msg) {
           await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['page-bridge.js'], world: 'MAIN' });
           await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
         }
-        await chrome.tabs.sendMessage(tab.id, { requestId, cmd, sessionId, ...params });
+        await chrome.tabs.sendMessage(tab.id, pageMsg);
       } catch (retryErr) {
-        send({ requestId, ok: false, error: retryErr.message });
+        await handleResponse(tabUnreachable(requestId, tab, retryErr));
       }
     } else {
-      send({ requestId, ok: false, error: err.message });
+      await handleResponse(tabUnreachable(requestId, tab, err));
     }
   }
+}
+
+// The page could not be reached at all, so nothing about the session was
+// checked. Classified so a caller never reads it as "session missing": a
+// crashed renderer ("Aw, Snap!") shows Chrome's error page, which refuses
+// script injection; anything else is a content script that will not answer.
+//
+// A crashed claude.ai tab keeps its claude.ai URL, and injection into it fails
+// with "Cannot access contents of the page. Extension manifest must request
+// permission…" (observed 2026-10-05, renderer killed from Task Manager) — a
+// permission error we cannot actually have on claude.ai, so on that host it
+// means the error page.
+function tabUnreachable(requestId, tab, err) {
+  const msg = err?.message ?? String(err);
+  const crashed = /error page|crash/i.test(msg)
+               || (/cannot access contents of the page/i.test(msg) && /^https:\/\/claude\.ai\//.test(tab.url ?? ''));
+  const reason = crashed ? 'tab_crashed' : 'content_unreachable';
+  diag(`tab ${tab.id} unreachable (${reason}): ${msg}`);
+  return {
+    requestId,
+    ok: false,
+    code: 'PAGE_UNREADABLE',
+    details: { reason, tabId: tab.id, url: tab.url ?? null, chromeError: msg },
+    error: `claude.ai tab ${tab.id} is not responding (${crashed ? 'the page has crashed' : 'the bridge script cannot reach it'}): ${msg}. ` +
+           'The session was not checked — this is NOT evidence it is missing.',
+  };
+}
+
+// What to do about a failed response, or null to report it as is.
+//
+// Only PAGE_UNREADABLE is recoverable, and only the causes a reload or an Escape
+// can plausibly fix. Every such failure happens BEFORE the command touched the
+// session (no row to click, or the page never got the message), so sending the
+// command again cannot double-apply it.
+//   tab_crashed / content_unreachable — the page is dead or deaf: reload it.
+//   error_screen / sidebar_empty      — the app failed to render: reload it.
+//   dialog_open                       — a pop-up is over the app: press Escape.
+// Not recovered: row_not_rendered (the app is fine; a reload would not add the
+// row), off_code_page (routing only ever picks a Code tab now), and anything
+// that is not a page problem at all (NOT_AUTHENTICATED, SESSION_NOT_FOUND…).
+function recoveryFor(response) {
+  if (response.ok || response.code !== 'PAGE_UNREADABLE') return null;
+  const reason = response.details?.page?.reason ?? response.details?.reason;
+  if (reason === 'tab_crashed' || reason === 'content_unreachable'
+   || reason === 'error_screen' || reason === 'sidebar_empty') return { action: 'reload_tab', reason };
+  if (reason === 'dialog_open') return { action: 'dismiss_dialog', reason };
+  return null;
+}
+
+// Every response from the page comes through here: report it, or recover the
+// page and send the command once more.
+async function handleResponse(response) {
+  const entry = inflight.get(response.requestId);
+  const plan = entry && !entry.recovery?.retried ? recoveryFor(response) : null;
+
+  if (plan) {
+    const left = budgetLeft(entry);
+    if (left < MIN_BUDGET_FOR_RECOVERY_MS) {
+      diag(`${entry.msg.cmd}: ${plan.reason} — not recovering, only ${Math.round(left / 1000)}s of budget left`);
+    } else {
+      diag(`${entry.msg.cmd}: ${plan.reason} on tab ${entry.tabId} — ${plan.action}, then retrying (requestId=${response.requestId})`);
+      entry.recovery = { ...plan, retried: true };
+      const ok = await recoverPage(entry.tabId, plan.action, Math.min(TAB_READY_TIMEOUT_MS, left - 8000));
+      if (ok) {
+        await dispatchToPage(response.requestId);
+        return;
+      }
+      diag(`${entry.msg.cmd}: ${plan.action} did not bring tab ${entry.tabId} back`);
+      entry.recovery.outcome = 'page_not_ready';
+    }
+  }
+  finish(response.requestId, response);
+}
+
+// Report the command's final answer, saying what recovery (if any) ran first.
+function finish(requestId, response) {
+  const entry = inflight.get(requestId);
+  inflight.delete(requestId);
+  const rec = entry?.recovery;
+  if (rec) {
+    const recovery = { action: rec.action, reason: rec.reason, outcome: rec.outcome ?? (response.ok ? 'recovered' : 'still_failing') };
+    if (response.ok) {
+      response.recovered = recovery;
+    } else {
+      response.details = { ...(response.details ?? {}), recovery };
+      if (response.code === 'PAGE_UNREADABLE') {
+        response.error += ` [recovery attempted: ${rec.action.replaceAll('_', ' ')} — ${recovery.outcome.replaceAll('_', ' ')}]`;
+      }
+    }
+  }
+  send(response);
+}
+
+// Open claude.ai/code in a background tab and wait for the app to render.
+async function openCodeTab() {
+  let tab;
+  try { tab = await chrome.tabs.create({ url: CODE_URL, active: false }); }
+  catch (e) { diag(`could not open ${CODE_URL}: ${e.message}`); return null; }
+  return (await waitForApp(tab.id, TAB_READY_TIMEOUT_MS)) ? await chrome.tabs.get(tab.id) : null;
+}
+
+async function recoverPage(tabId, action, timeoutMs) {
+  try {
+    if (action === 'dismiss_dialog') {
+      // Escape is what closes claude.ai's pop-ups (Settings, menus, pickers),
+      // and on a confirm dialog it means cancel, so it can never accept
+      // anything. Sent to the focused element and the document, the two places
+      // a dialog listens.
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => {
+          const opts = { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true, cancelable: true };
+          (document.activeElement ?? document.body).dispatchEvent(new KeyboardEvent('keydown', opts));
+          document.dispatchEvent(new KeyboardEvent('keydown', opts));
+        },
+      });
+      await new Promise(r => setTimeout(r, 600));
+      return true;
+    }
+    // reload_tab. A crashed tab keeps its URL, so a reload returns it to the
+    // same Code page. The content script is re-injected by the manifest.
+    await chrome.tabs.reload(tabId);
+    return await waitForApp(tabId, timeoutMs);
+  } catch (e) {
+    diag(`recovery ${action} on tab ${tabId} failed: ${e.message}`);
+    return false;
+  }
+}
+
+// Wait until the Code app has rendered in `tabId`: the sidebar has a row or the
+// composer is up. Polled from the worker (not the page), so a throttled
+// background tab cannot stretch it.
+async function waitForApp(tabId, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 750));
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab.status !== 'complete') continue;
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => !!(document.querySelector('[data-row-key^="code:"]')
+                    || document.querySelector('div[contenteditable="true"][aria-label="Prompt"]')),
+      });
+      if (res?.result) {
+        // Give the content script a moment to register its listener.
+        await new Promise(r => setTimeout(r, 500));
+        return true;
+      }
+    } catch { /* still loading, or showing an error page — keep waiting */ }
+  }
+  return false;
 }
 
 // Durable outbox: if the native port is momentarily down (worker respawn /
@@ -238,7 +434,7 @@ function flushOutbox() {
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === 'cmd_response') {
     const { type, ...response } = msg;
-    send(response);
+    handleResponse(response);
   } else if (msg.type === 'state_change') {
     send(msg);
   } else if (msg.type === 'log') {

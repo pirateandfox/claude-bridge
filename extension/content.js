@@ -145,6 +145,46 @@ function isArchivedSession(s) {
   return false;
 }
 
+// Normalise back to the `session_` prefix. That is this bridge's canonical
+// external id — the sidebar keys rows `code:session_…`, /code/<id> URLs use
+// it, and every other command resolves a DOM row by it. The API speaks
+// `cse_` (readTranscript converts the other way for the same reason), so
+// returning s.id raw would hand callers ids that get_state, inject and
+// archive all reject with "Session not found".
+function mapApiSession(s) {
+  return {
+    sessionId: String(s.id ?? '').replace(/^cse_/, 'session_'),
+    title:     s.title ?? '',
+    // workerStatus is the only trustworthy busy/idle signal — the sidebar's
+    // aria-label is not (it read "Running" for sessions the API reports idle,
+    // one with an already-merged PR).
+    //
+    // statusBucket is passed through RAW FOR OBSERVATION ONLY. Its semantics
+    // are unverified: on 2026-08-03 it was not "PR merged" (two blocked
+    // sessions had open PRs), not derived from PR state (an open+conflicting
+    // PR appeared in both buckets), and not "ended asking a human" (a blocked
+    // session asked nothing, a review_ready one asked). A merged and finished
+    // session still read "blocked", so it does not clear on completion. Kept
+    // because watching it move across a live pipeline is the only way to learn
+    // what drives it — but nothing should route on it until that is known.
+    statusBucket: s.status_bucket ?? null,
+    workerStatus: s.worker_status ?? null,
+    // `session_status` does not exist on this API (confirmed 2026-08-03 — the
+    // old code read it and silently got undefined for every row). `status` is
+    // the session's own state; `worker_status` describes its container, used
+    // only as a fallback.
+    //
+    // Exception: a session parked on a permission card (worker_status
+    // "requires_action") is surfaced as awaiting_approval, so a caller scanning
+    // the list can see which sessions need a person without a get_state each.
+    state:     s.worker_status === 'requires_action'
+                 ? 'awaiting_approval'
+                 : (s.status ?? s.worker_status ?? 'unknown'),
+    needsHuman: s.worker_status === 'requires_action',
+    repo:      s.session_context?.outcomes?.[0]?.git_info?.repo ?? null,
+  };
+}
+
 async function readSessions(includeArchived = false) {
   try {
     // On a cold/remote box the very first fetch often times out before the SPA
@@ -217,43 +257,6 @@ async function readSessions(includeArchived = false) {
       }
     }
 
-    // Normalise back to the `session_` prefix. That is this bridge's canonical
-    // external id — the sidebar keys rows `code:session_…`, /code/<id> URLs use
-    // it, and every other command resolves a DOM row by it. The API speaks
-    // `cse_` (readTranscript converts the other way for the same reason), so
-    // returning s.id raw would hand callers ids that get_state, inject and
-    // archive all reject with "Session not found".
-    const mapSession = s => ({
-      sessionId: String(s.id ?? '').replace(/^cse_/, 'session_'),
-      title:     s.title ?? '',
-      // workerStatus is the only trustworthy busy/idle signal — the sidebar's
-      // aria-label is not (it read "Running" for sessions the API reports idle,
-      // one with an already-merged PR).
-      //
-      // statusBucket is passed through RAW FOR OBSERVATION ONLY. Its semantics
-      // are unverified: on 2026-08-03 it was not "PR merged" (two blocked
-      // sessions had open PRs), not derived from PR state (an open+conflicting
-      // PR appeared in both buckets), and not "ended asking a human" (a blocked
-      // session asked nothing, a review_ready one asked). A merged and finished
-      // session still read "blocked", so it does not clear on completion. Kept
-      // because watching it move across a live pipeline is the only way to learn
-      // what drives it — but nothing should route on it until that is known.
-      statusBucket: s.status_bucket ?? null,
-      workerStatus: s.worker_status ?? null,
-      // `session_status` does not exist on this API (confirmed 2026-08-03 — the
-      // old code read it and silently got undefined for every row). `status` is
-      // the session's own state; `worker_status` describes its container, used
-      // only as a fallback.
-      //
-      // Exception: a session parked on a permission card (worker_status
-      // "requires_action") is surfaced as awaiting_approval, so a caller scanning
-      // the list can see which sessions need a person without a get_state each.
-      state:     s.worker_status === 'requires_action'
-                   ? 'awaiting_approval'
-                   : (s.status ?? s.worker_status ?? 'unknown'),
-      needsHuman: s.worker_status === 'requires_action',
-      repo:      s.session_context?.outcomes?.[0]?.git_info?.repo ?? null,
-    });
 
     // Archived sessions are finished work kept only for history — they are gone
     // from the sidebar, and including them turned a 9-row "what is open" list
@@ -262,7 +265,7 @@ async function readSessions(includeArchived = false) {
     const visible = includeArchived ? rawSessions : rawSessions.filter(s => !isArchivedSession(s));
     const hidden  = rawSessions.length - visible.length;
     if (hidden > 0) relayLog(`sessions API filtered ${hidden} archived session(s)`);
-    const apiSessions = visible.map(mapSession);
+    const apiSessions = visible.map(mapApiSession);
     // An empty API result is ambiguous on a cold/booting page: /v1/sessions can
     // return {data: []} transiently while the SPA's workspace context is still
     // being established (cookies present, sessions not yet indexed). Only trust
@@ -284,7 +287,7 @@ async function readSessions(includeArchived = false) {
     // the agent sees "log in", not an empty list. Everything else (timeout,
     // transient network) falls back to scraping the sidebar DOM.
     if (e.message === 'NOT_AUTHENTICATED') {
-      throw new Error('Not signed in to claude.ai in the bridge browser. Open https://claude.ai/code in that Chrome profile, log in, then retry.');
+      throw bridgeError('NOT_AUTHENTICATED', 'Not signed in to claude.ai in the bridge browser. Open https://claude.ai/code in that Chrome profile, log in, then retry.');
     }
     relayLog(`sessions API failed (${e.message}); using DOM fallback`);
     const domSessions = readSessionsFromDom();
@@ -304,13 +307,184 @@ async function readSessions(includeArchived = false) {
 // Includes archived sessions on purpose: get_state should answer for any id the
 // caller holds, not only the ones currently in the sidebar.
 async function readSessionMeta(sessionId) {
-  try {
-    const all = await readSessions(true);
-    return all.find(s => s.sessionId === sessionId) ?? null;
-  } catch (e) {
-    relayLog(`session meta lookup failed for ${sessionId} (${e.message})`);
-    return null;
+  const r = await lookupSession(sessionId);
+  if (r.status === 'found') return r.meta;
+  relayLog(`session meta lookup for ${sessionId}: ${r.status}${r.error ? ` (${r.error})` : ''}`);
+  return null;
+}
+
+// An Error carrying a machine-readable `code` (and optional `details`) that the
+// command handler relays to the daemon alongside the message.
+//
+// Codes a caller can route on:
+//   SESSION_NOT_FOUND  — the API answered 404 for this id: it does not exist.
+//   INVALID_SESSION_ID — the id is malformed; it cannot exist.
+//   SESSION_ARCHIVED   — exists, but archived, so there is no sidebar row to act on.
+//   NOT_AUTHENTICATED  — the bridge browser is not signed in to claude.ai.
+//   PAGE_UNREADABLE    — the page could not show the session (pop-up, error
+//                        screen, empty sidebar, crashed tab) or the API could not
+//                        be reached. NOT evidence the session is missing.
+function bridgeError(code, message, details = null) {
+  const e = new Error(message);
+  e.code = code;
+  if (details) e.details = details;
+  return e;
+}
+
+// Does this one session exist? Asked of the API directly rather than by finding
+// it in the sidebar or the list.
+//
+// "Session not found" used to mean only "no sidebar row, and not in the list
+// either" — and both of those come back empty whenever the page itself is the
+// problem: a pop-up over the app, a crashed or half-booted page, an API call
+// that timed out (readSessions swallows that and falls back to the same empty
+// sidebar). The list is also capped at its first page (?limit=100, with a
+// next_cursor), so any older session read as missing too. A caller could not
+// tell "gone" from "could not look", and acted on the wrong one.
+//
+// GET /v1/code/sessions/<cse_id> answers exactly the question (verified
+// 2026-10-05): 200 with the session wrapped in `response_shape`, 404
+// not_found_error with resource_type "session" for a well-formed id that does
+// not exist, 400 invalid_request_error for a malformed one. A 404 WITHOUT that
+// error body is a route-level 404 (the list endpoint has already moved once) —
+// that says nothing about the session, so it is "unreadable", not "not_found".
+//
+// Returns { status, apiStatus, meta?, archived?, error? } where status is
+// found | not_found | invalid_id | unauthenticated | unreadable. Never throws.
+async function lookupSession(sessionId, timeoutMs = 6000) {
+  if (!/^session_[A-Za-z0-9]+$/.test(String(sessionId ?? ''))) {
+    return { status: 'invalid_id', apiStatus: null, error: 'expected a session_… id' };
   }
+  const cseId = sessionId.replace(/^session_/, 'cse_');
+  let last = null;
+  // One retry, for the timeout / transient case only — a definite answer
+  // (found, 404, 400, 401) returns immediately.
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    last = await lookupSessionOnce(cseId, timeoutMs);
+    if (last.status !== 'unreadable') return last;
+    if (attempt < 2) await sleep(500);
+  }
+  return last;
+}
+
+async function lookupSessionOnce(cseId, timeoutMs) {
+  let resp;
+  try {
+    resp = await fetchWithTimeout(`/v1/code/sessions/${cseId}`, {
+      credentials: 'include',
+      headers: {
+        'anthropic-beta':    'managed-agents-2026-04-01',
+        'anthropic-version': '2023-06-01',
+      },
+    }, timeoutMs);
+  } catch (e) {
+    return { status: 'unreadable', apiStatus: null, error: e.message };
+  }
+  if (resp.status === 401 || resp.status === 403) return { status: 'unauthenticated', apiStatus: resp.status };
+  let body = null;
+  try { body = await resp.json(); } catch {}
+  if (resp.status === 404) {
+    const err = body?.error;
+    return err?.type === 'not_found_error' && (err.resource_type ?? 'session') === 'session'
+      ? { status: 'not_found', apiStatus: 404 }
+      : { status: 'unreadable', apiStatus: 404, error: 'session route returned 404 without a session not_found_error' };
+  }
+  if (resp.status === 400) return { status: 'invalid_id', apiStatus: 400, error: body?.error?.message ?? 'rejected as invalid' };
+  if (!resp.ok || !body) return { status: 'unreadable', apiStatus: resp.status, error: `Session API ${resp.status}` };
+  const raw = body.response_shape ?? body;
+  return { status: 'found', apiStatus: resp.status, meta: mapApiSession(raw), archived: isArchivedSession(raw) };
+}
+
+// What is on the page right now, for explaining why a session's row is not
+// there. Read-only. `reason` is the single most likely cause, in priority order:
+//   dialog_open      — a modal / pop-up is over the app
+//   error_screen     — no app chrome, and the page text reads like an error
+//   off_code_page    — the tab is not on /code or /code/session_…
+//   sidebar_empty    — on the app, but the sidebar has rendered no rows at all
+//   row_not_rendered — the sidebar has rows, just not this one
+function pageDiagnostics() {
+  const isVisible = el => {
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return false;
+    const cs = getComputedStyle(el);
+    return cs.display !== 'none' && cs.visibility !== 'hidden';
+  };
+  // The approval card is part of the session, not something in its way.
+  const candidates = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"], dialog[open]')]
+    .filter(el => isVisible(el) && !el.closest(SEL.approvalCard) && !el.querySelector(SEL.approvalCard));
+  const dialogs = candidates
+    .filter(el => !candidates.some(o => o !== el && o.contains(el)))   // outermost only
+    .map(el => ({
+      role:  el.getAttribute('role') ?? el.tagName.toLowerCase(),
+      label: normText(el.getAttribute('aria-label') ?? el.querySelector('h1, h2, h3')?.textContent ?? '').slice(0, 80),
+      text:  normText(el.innerText).slice(0, 160),
+    }));
+
+  const sidebarRows = document.querySelectorAll(SEL.sessionRow).length;
+  const composer    = !!document.querySelector(SEL.chatInput);
+  const onCodeApp   = /^\/code\/?(session_[A-Za-z0-9]+\/?)?$/.test(location.pathname);
+  // Only quote the page when the app itself is not rendering — that text is the
+  // error screen, and the one clue to what broke.
+  const bodyText    = (sidebarRows || composer) ? null : normText(document.body?.innerText).slice(0, 160);
+  const errorScreen = !!bodyText && /something went wrong|application error|unexpected error|error loading|try again|reload/i.test(bodyText);
+
+  const reason = dialogs.length ? 'dialog_open'
+               : errorScreen    ? 'error_screen'
+               : !onCodeApp     ? 'off_code_page'
+               : !sidebarRows   ? 'sidebar_empty'
+               :                  'row_not_rendered';
+  return { reason, path: location.pathname, dialogs, errorScreen, bodyText, sidebarRows, composer, visibility: document.visibilityState };
+}
+
+// The error for "there is no sidebar row for this session" — classified by
+// asking the API whether the session exists, so a page problem is never
+// reported as a missing session. Pass `lookup` if it has already been done.
+async function sessionRowMissingError(sessionId, lookup = null) {
+  lookup ??= await lookupSession(sessionId);
+  const page = pageDiagnostics();
+  const details = {
+    sessionId,
+    lookup: { status: lookup.status, apiStatus: lookup.apiStatus ?? null, error: lookup.error ?? null },
+    page,
+  };
+  relayLog(`no row for ${sessionId}: api=${lookup.status}${lookup.apiStatus ? `/${lookup.apiStatus}` : ''} page=${page.reason} dialogs=${page.dialogs.length} rows=${page.sidebarRows}`);
+
+  switch (lookup.status) {
+    case 'not_found':
+      return bridgeError('SESSION_NOT_FOUND', `Session not found: ${sessionId} (the sessions API reports it does not exist)`, details);
+    case 'invalid_id':
+      return bridgeError('INVALID_SESSION_ID', `Invalid session id: ${sessionId} (${lookup.error})`, details);
+    case 'unauthenticated':
+      return bridgeError('NOT_AUTHENTICATED', 'Not signed in to claude.ai in the bridge browser. Open https://claude.ai/code in that Chrome profile, log in, then retry.', details);
+    case 'found':
+      if (lookup.archived) {
+        return bridgeError('SESSION_ARCHIVED', `Session ${sessionId} is archived — it has no sidebar row to act on`, details);
+      }
+      return bridgeError('PAGE_UNREADABLE',
+        `Session ${sessionId} exists, but the claude.ai page is not showing it (${describePage(page)}). ` +
+        'The session is NOT missing — clear the page and retry.', details);
+    default:
+      return bridgeError('PAGE_UNREADABLE',
+        `Could not confirm whether session ${sessionId} exists: the sessions API failed (${lookup.error ?? 'no answer'}) ` +
+        `and the page shows no row for it (${describePage(page)}). This is NOT evidence the session is missing.`, details);
+  }
+}
+
+function describePage(page) {
+  switch (page.reason) {
+    case 'dialog_open':   return `a pop-up is open over the page: ${page.dialogs.map(d => `"${d.label || d.text.slice(0, 60) || d.role}"`).join(', ')}`;
+    case 'error_screen':  return `the page is showing an error: "${page.bodyText}"`;
+    case 'off_code_page': return `the tab is on ${page.path}, not the Code sessions page`;
+    case 'sidebar_empty': return 'the session sidebar has not rendered any rows';
+    default:              return `the sidebar shows ${page.sidebarRows} row(s) but not this one`;
+  }
+}
+
+// The sidebar row for `sessionId`, or a classified error explaining why not.
+async function requireSessionRow(sessionId) {
+  const row = document.querySelector(`[data-row-key="code:${sessionId}"]`);
+  if (row) return row;
+  throw await sessionRowMissingError(sessionId);
 }
 
 // Collapse API metadata into the state vocabulary callers already expect.
@@ -902,8 +1076,7 @@ function findSendButton() {
 // checking identity themselves before touching session-scoped UI — see the
 // `inject` case. Do not "fix" this by throwing here without auditing get_state.
 async function navigateToSession(sessionId) {
-  const row = document.querySelector(`[data-row-key="code:${sessionId}"]`);
-  if (!row) throw new Error(`Session not found: ${sessionId}`);
+  const row = await requireSessionRow(sessionId);
 
   row.querySelector(SEL.rowMainBtn)?.click();
 
@@ -1605,8 +1778,7 @@ async function setModelEffort(model, effort) {
 }
 
 async function archiveSession(sessionId) {
-  const row = document.querySelector(`[data-row-key="code:${sessionId}"]`);
-  if (!row) throw new Error(`Session not found: ${sessionId}`);
+  const row = await requireSessionRow(sessionId);
 
   row.querySelector(SEL.rowAction)?.click();
   await sleep(200);
@@ -2121,18 +2293,24 @@ chrome.runtime.onMessage.addListener((msg) => {
         case 'get_state': {
           const row = document.querySelector(`[data-row-key="code:${msg.sessionId}"]`);
           if (!row) {
-            // Archived sessions are not rendered in the sidebar at all, so there
-            // is no row to click and the UI-scraped fields are unreachable — but
-            // the API still knows the session. Answer with metadata and return
-            // the scraped fields as null rather than failing the whole call, so
-            // "this id is archived" is distinguishable from "this id is bogus".
-            const meta = await readSessionMeta(msg.sessionId);
-            if (!meta) { respond(requestId, { ok: false, error: 'Session not found' }); break; }
-            relayLog(`get_state ${msg.sessionId}: no sidebar row (archived?) — metadata only (worker=${meta.workerStatus ?? 'n/a'} bucket=${meta.statusBucket ?? 'n/a'})`);
+            // No row to click, so the UI-scraped fields are unreachable — but
+            // the API may still know the session. Archived sessions are never in
+            // the sidebar; a live one is missing only when the page cannot show
+            // it (pop-up, error screen, empty sidebar). Either way answer with
+            // the API's metadata and the scraped fields as null rather than
+            // failing the whole call, and say why the page could not help in
+            // `pageIssue`. Only an id the API itself does not know is an error —
+            // classified, so "missing" and "could not look" stay distinct.
+            const lookup = await lookupSession(msg.sessionId);
+            if (lookup.status !== 'found') throw await sessionRowMissingError(msg.sessionId, lookup);
+            const meta = lookup.meta;
+            const pageIssue = lookup.archived ? null : pageDiagnostics();
+            relayLog(`get_state ${msg.sessionId}: no sidebar row (${lookup.archived ? 'archived' : `page: ${pageIssue.reason}`}) — metadata only (worker=${meta.workerStatus ?? 'n/a'} bucket=${meta.statusBucket ?? 'n/a'})`);
             const resolvedArchived = await resolvedApprovalsSafe(msg);
             respond(requestId, {
               ...resolvedArchived,
               ok: true,
+              pageIssue,
               state:        deriveSessionState(meta, 'unknown'),
               needsHuman:   deriveSessionState(meta, 'unknown') === 'awaiting_approval',
               statusBucket: meta.statusBucket ?? null,
@@ -2220,6 +2398,11 @@ chrome.runtime.onMessage.addListener((msg) => {
           // the API said (or if it could not be reached) — the two signals are
           // OR'd so a blocked session is flagged if either one sees it.
           const finalState = scraped.approval && gsState !== 'archived' ? 'awaiting_approval' : gsState;
+          // The row is there, so the only page problem left to report is a
+          // pop-up sitting over the app — the scraped fields above may be null
+          // or stale because of it.
+          const page = pageDiagnostics();
+          const pageIssue = page.dialogs.length ? page : null;
           const resolved = await resolvedP;
           relayLog(`get_state ${msg.sessionId}: state=${finalState} (worker=${gsMeta?.workerStatus ?? 'n/a'} bucket=${gsMeta?.statusBucket ?? 'n/a'}) branch=${scraped.branchBar?.featureBranch ?? 'none'} usagePct=${scraped.usagePct ?? 'n/a'} approval=${scraped.approval ? `${scraped.approval.kind}:${scraped.approval.action ?? scraped.approval.question?.header ?? scraped.approval.id ?? '?'}` : 'none'}`);
           respond(requestId, {
@@ -2233,6 +2416,7 @@ chrome.runtime.onMessage.addListener((msg) => {
             effort:    scraped.effort,
             usagePct:  scraped.usagePct,
             approval:  scraped.approval,
+            pageIssue,
             ...resolved,
           });
           break;
@@ -2351,7 +2535,12 @@ chrome.runtime.onMessage.addListener((msg) => {
           respond(requestId, { ok: false, error: `Unknown command: ${msg.cmd}` });
       }
     } catch (err) {
-      respond(requestId, { ok: false, error: err.message });
+      respond(requestId, {
+        ok: false,
+        error: err.message,
+        ...(err.code    ? { code: err.code }       : {}),
+        ...(err.details ? { details: err.details } : {}),
+      });
     }
   })();
 
