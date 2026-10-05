@@ -182,7 +182,25 @@ function mapApiSession(s) {
                  : (s.status ?? s.worker_status ?? 'unknown'),
     needsHuman: s.worker_status === 'requires_action',
     repo:      s.session_context?.outcomes?.[0]?.git_info?.repo ?? null,
+    // The session's own model, e.g. "claude-opus-5[1m]". Authoritative — see
+    // modelDisplayName for why get_state reports this rather than the chip.
+    modelId:   s.config?.model ?? null,
   };
+}
+
+// "claude-opus-5[1m]" → "Opus 5", "claude-fable-5-1" → "Fable 5.1",
+// "claude-haiku-4-5-20251001" → "Haiku 4.5" — the name the model chip shows.
+//
+// get_state used to report the chip's text as the session's model, but the chip
+// is the composer's selector and lags the route: on a get_state that navigated
+// from the blank composer it still showed the account default ("Opus 5.5") for
+// a session whose config.model was claude-opus-5[1m] (2026-10-05). The API
+// field cannot bleed between sessions. Unrecognised ids pass through as is.
+function modelDisplayName(id) {
+  if (!id) return null;
+  const m = String(id).replace(/\[[^\]]*\]$/, '').match(/^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?$/i);
+  if (!m) return String(id);
+  return `${m[1][0].toUpperCase()}${m[1].slice(1)} ${m[2]}${m[3] ? `.${m[3]}` : ''}`;
 }
 
 async function readSessions(includeArchived = false) {
@@ -600,9 +618,17 @@ function readModelEffortUsage() {
     }
   }
 
+  // The label was "Usage: plan N%". It is now (2026-10-05) "Usage: Context
+  // 459.5k / 1M (46%), 10% of session limit, Resets in 3 hr 47 min" — the FIRST
+  // percentage is the session's context fill, not the plan meter, so taking the
+  // first match reported 46 for a 10% plan. Key on the wording; fall back to the
+  // old shape, and report nothing rather than the context figure.
   const usageBtn = document.querySelector(SEL.usageBtn);
   if (usageBtn) {
-    const um = usageBtn.getAttribute('aria-label').match(/(\d+)%/);
+    const label = usageBtn.getAttribute('aria-label') ?? '';
+    const um = label.match(/(\d+(?:\.\d+)?)%\s+of\s+(?:session|plan|weekly)?\s*limit/i)
+            ?? label.match(/plan\s+(\d+(?:\.\d+)?)%/i)
+            ?? (/context/i.test(label) ? null : label.match(/(\d+(?:\.\d+)?)%/));
     if (um) usagePct = +um[1];
   }
 
@@ -2316,7 +2342,8 @@ chrome.runtime.onMessage.addListener((msg) => {
               statusBucket: meta.statusBucket ?? null,
               workerStatus: meta.workerStatus ?? null,
               branchBar: null,
-              model:     null,
+              model:     modelDisplayName(meta.modelId),
+              modelId:   meta.modelId ?? null,
               effort:    null,
               usagePct:  null,
               approval:  null,
@@ -2378,6 +2405,11 @@ chrome.runtime.onMessage.addListener((msg) => {
             // app chrome, identical for every session — so it needs no per-session
             // gating (an earlier attempt to "wait until it changes" wrongly forced
             // a timeout, since a global value never changes between sessions).
+            //
+            // The usage meter renders a beat after the composer on a freshly
+            // loaded page (e.g. right after a recovery reload), so give it a
+            // moment rather than reporting null. Costs nothing when it is up.
+            if (!document.querySelector(SEL.usageBtn)) await pollUntil(() => document.querySelector(SEL.usageBtn), 2500);
             const mev = readModelEffortUsage();
 
             // The permission card. Only wait for it when the API says the session
@@ -2412,7 +2444,10 @@ chrome.runtime.onMessage.addListener((msg) => {
             statusBucket: gsMeta?.statusBucket ?? null,
             workerStatus: gsMeta?.workerStatus ?? null,
             branchBar: scraped.branchBar,
-            model:     scraped.model,
+            // The API's model, not the chip's — see modelDisplayName. The chip is
+            // the fallback only when the API could not be read.
+            model:     gsMeta?.modelId ? modelDisplayName(gsMeta.modelId) : scraped.model,
+            modelId:   gsMeta?.modelId ?? null,
             effort:    scraped.effort,
             usagePct:  scraped.usagePct,
             approval:  scraped.approval,
