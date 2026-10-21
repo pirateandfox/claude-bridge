@@ -9,7 +9,18 @@ const SEL = {
   // "Show 20 more in Recents" row (one click reveals them all, and the same
   // button then reads "Show less in Recents"). Verified 2026-10-05.
   showMoreBtn:   '[data-row-key^="label:showmore:"] button',
+  // Legacy branch row. Gone by 2026-10-21: the session page now carries a
+  // right-hand rail (sessionRail) whose cards hold the same facts — the
+  // environment card has the repo and branch, the pullRequests card has the PR
+  // link, diff stats, CI and "Create PR". Both layouts are read; see readBranchBar.
   branchBar:     '.epitaxy-branch-row',
+  sessionRail:   'aside[aria-label="Session details"]',
+  railEnvCard:   '[data-rail-card="environment"]',
+  railPrCard:    '[data-rail-card="pullRequests"]',
+  prMoreBtn:     'button[aria-label^="More options for"]',
+  // Model and effort share one chip ("Model: Opus 5.5 Medium"); effort is a
+  // submenu of the model menu (2026-10-21).
+  modelChip:     'button[data-testid="environment-row-model"], button[aria-label^="Model:"]',
   diffSrOnly:    '.sr-only',
   ciBtn:         'button[aria-label^="CI:"]',   // e.g. "CI: all checks passed" — semantic, survives theming
   ciDot:         '.bg-extended-green, .bg-extended-red, .bg-extended-yellow',   // legacy colour fallback
@@ -27,7 +38,9 @@ const SEL = {
   repoTrigger:   'button[role="combobox"]',                               // any chip; disambiguated by chipValue()
   addRepoBtn:    'button[role="combobox"][aria-label="Add repository"]',  // the "+" — never click for selection
   repoOption:    '[role="option"], [cmdk-item], [role="menuitemradio"]',  // repo entries in the open picker
-  repoSearch:    'input[placeholder="Search repos…"]',               // type-to-filter input (… is U+2026)
+  // Type-to-filter input (… is U+2026). Renamed to "Search all repositories…"
+  // by 2026-10-21; the old placeholder is kept for older builds.
+  repoSearch:    'input[placeholder="Search all repositories…"], input[placeholder="Search repos…"]',
   // Tool-permission card ("Allow Claude to use X?"). The card numbers its own
   // buttons: the root carries data-approval-card-digits="N" and each button's
   // label span carries data-approval-digit="1".."N", so the option set is read
@@ -38,6 +51,7 @@ const SEL = {
   approvalSent:  'ul[aria-label="What Claude sent"] > li',
   // AskUserQuestion card (same root as above; see readApprovalCard for the shape).
   questionOther:   'textarea[aria-label="Other option"]',
+  questionOtherBtn: 'button[aria-label="Other"]',
   questionDismiss: 'button[aria-label="Dismiss question"]',
 };
 
@@ -129,6 +143,7 @@ const SESSION_LIST_ENDPOINTS = [
   '/v1/code/sessions?limit=100',
   '/v1/sessions?limit=100',
 ];
+const SESSION_LIST_MAX_PAGES = 20;
 
 // Archived-session detection. The API field is undocumented and this route has
 // already moved once, so check every plausible marker rather than betting on
@@ -181,15 +196,42 @@ function mapApiSession(s) {
     // Exception: a session parked on a permission card (worker_status
     // "requires_action") is surfaced as awaiting_approval, so a caller scanning
     // the list can see which sessions need a person without a get_state each.
-    state:     s.worker_status === 'requires_action'
-                 ? 'awaiting_approval'
-                 : (s.status ?? s.worker_status ?? 'unknown'),
-    needsHuman: s.worker_status === 'requires_action',
-    repo:      s.session_context?.outcomes?.[0]?.git_info?.repo ?? null,
+    //
+    // Archived wins over requires_action: a session archived while a card was
+    // open keeps worker_status "requires_action" forever (7 of 100 on
+    // 2026-10-21), and reporting finished work as needing a person is wrong.
+    state:     isArchivedSession(s) ? 'archived'
+             : s.worker_status === 'requires_action' ? 'awaiting_approval'
+             : (s.status ?? s.worker_status ?? 'unknown'),
+    needsHuman: !isArchivedSession(s) && s.worker_status === 'requires_action',
+    // The outcomes moved from session_context to config (2026-10-21); reading
+    // only the old path reported repo:null for every session, which FlightDesk
+    // then took as "launched with no git remote". Old path kept as a fallback.
+    repo:      apiGitInfo(s)?.repo ?? null,
+    branch:    apiFeatureBranch(s),
     // The session's own model, e.g. "claude-opus-5[1m]". Authoritative — see
     // modelDisplayName for why get_state reports this rather than the chip.
     modelId:   s.config?.model ?? null,
   };
+}
+
+// The session's git outcome ({ repo, branches, type, … }), wherever this API
+// build keeps it.
+function apiGitInfo(s) {
+  const outcomes = s?.config?.outcomes ?? s?.session_context?.outcomes ?? [];
+  return outcomes.find(o => o?.git_info)?.git_info ?? null;
+}
+
+// The session's working branch, from the API. external_metadata.current_branches
+// is keyed by repo path ("" for the primary checkout) and tracks a rename; the
+// outcome's branches list is the branch the session was created to push to.
+function apiFeatureBranch(s) {
+  const cur = s?.external_metadata?.current_branches;
+  if (cur && typeof cur === 'object') {
+    const b = cur[''] ?? Object.values(cur)[0];
+    if (b) return String(b);
+  }
+  return apiGitInfo(s)?.branches?.[0] ?? null;
 }
 
 // "claude-opus-5[1m]" → "Opus 5", "claude-fable-5-1" → "Fable 5.1",
@@ -258,6 +300,32 @@ async function readSessions(includeArchived = false) {
     if (!resp.ok) throw new Error(`Sessions API ${resp.status}`);
     const data = await resp.json();
     const rawSessions = data.data ?? [];
+
+    // Follow next_cursor. The list is ?limit=100 per page and is not ordered
+    // live-first: on 2026-10-21 this account had 532 sessions across six pages,
+    // so a live session on page 2+ was simply absent from the open list (and
+    // from include_archived). Capped so a cursor that never ends cannot hang
+    // the call; a page that fails keeps what was already read.
+    let cursor = data.next_cursor ?? null;
+    for (let page = 2; cursor && page <= SESSION_LIST_MAX_PAGES; page++) {
+      try {
+        const r = await fetchWithTimeout(`${usedEndpoint}&cursor=${encodeURIComponent(cursor)}`, {
+          credentials: 'include',
+          headers: {
+            'anthropic-beta':    'managed-agents-2026-04-01',
+            'anthropic-version': '2023-06-01',
+          },
+        }, 8000);
+        if (!r.ok) { relayLog(`sessions API page ${page} → ${r.status}; stopping at ${rawSessions.length}`); break; }
+        const more = await r.json();
+        rawSessions.push(...(more.data ?? []));
+        cursor = (more.data ?? []).length ? (more.next_cursor ?? null) : null;
+      } catch (e) {
+        relayLog(`sessions API page ${page} failed (${e.message}); stopping at ${rawSessions.length}`);
+        break;
+      }
+    }
+    if (cursor) relayLog(`sessions API stopped at ${SESSION_LIST_MAX_PAGES} pages with more remaining`);
 
     // One-time shape diagnostic. The archived marker is not documented anywhere
     // we control and claude.ai has already moved this route once, so record the
@@ -545,6 +613,8 @@ async function requireSessionRow(sessionId) {
 function deriveSessionState(meta, domState) {
   if (meta) {
     const worker = String(meta.workerStatus ?? '').toLowerCase();
+    // Archived first — see mapApiSession.
+    if (String(meta.state ?? '').toLowerCase() === 'archived') return 'archived';
     // A session parked on a permission card reports worker_status
     // "requires_action" (confirmed 2026-09-25). It is not working and will not
     // until someone answers, so reporting it as "running" hid it from callers.
@@ -556,9 +626,74 @@ function deriveSessionState(meta, domState) {
   return domState && domState !== 'unknown' ? domState : 'unknown';
 }
 
+// Any session-detail chrome: the legacy branch row or the session rail. Only a
+// session page mounts either.
+function sessionPanelEl() {
+  return document.querySelector(SEL.branchBar) ?? document.querySelector(SEL.sessionRail);
+}
+
 function readBranchBar() {
   const bar = document.querySelector(SEL.branchBar);
-  if (!bar) return null;
+  return bar ? readLegacyBranchBar(bar) : readRailBranchBar();
+}
+
+// The session rail (2026-10-21). Same return shape as the legacy row, so every
+// caller — freshness gate, get_state, create_pr — is layout-agnostic.
+//
+//   environment card — [Full Access] [repo menu button, no aria-label]
+//                      [Add repository…] [branch menu button, aria-label = the
+//                      full branch name; its visible text wraps mid-name]
+//   pullRequests card — "Changes": PR status span[role=img][aria-label="Open"],
+//                      a[href*="/pull/"] titled with the PR title, "#N",
+//                      "Open changes, A added, R removed" button with a .sr-only
+//                      "A additions, R deletions", "CI: …" button, or a
+//                      "Create PR" button when there is a diff but no PR.
+//
+// Returns null when the rail shows no branch — the analogue of the old row not
+// being mounted — so "no branch yet" still reads as no bar.
+function readRailBranchBar() {
+  const rail = document.querySelector(SEL.sessionRail);
+  const env  = rail?.querySelector(SEL.railEnvCard);
+  if (!env) return null;
+
+  const menuBtns = [...env.querySelectorAll('button[aria-haspopup="menu"]')];
+  const branchBtn = menuBtns.find(b => {
+    const al = b.getAttribute('aria-label') ?? '';
+    return al && !/^add repository/i.test(al);
+  });
+  const featureBranch = (branchBtn?.getAttribute('aria-label') ?? '').trim() || null;
+  const repo = (menuBtns.find(b => !b.getAttribute('aria-label'))?.textContent ?? '').trim() || null;
+  // The branch button renders before the repo chip — a card without the repo is
+  // still mounting, not a session without one.
+  if (!featureBranch || !repo) return null;
+
+  const card = rail.querySelector(SEL.railPrCard);
+  let prState = 'none', prNumber = null, prUrl = null;
+  const prLink = card?.querySelector('a[href*="/pull/"]');
+  if (prLink) {
+    prUrl = prLink.getAttribute('href');
+    const nm = prUrl.match(/\/pull\/(\d+)/) || (card.textContent || '').match(/#(\d+)/);
+    if (nm) prNumber = +nm[1];
+    const statusLabel = card.querySelector('[role="img"][aria-label]')?.getAttribute('aria-label')?.trim().toLowerCase();
+    prState = statusLabel || 'open';
+  }
+
+  const diffText  = [...(card?.querySelectorAll(SEL.diffSrOnly) ?? [])].map(e => e.textContent).join(' ');
+  const diffMatch = diffText.match(/(\d+) additions?,\s*(\d+) deletions?/);
+  const additions = diffMatch ? +diffMatch[1] : 0;
+  const deletions = diffMatch ? +diffMatch[2] : 0;
+
+  const ciLabel = (card?.querySelector(SEL.ciBtn)?.getAttribute('aria-label') ?? '').toLowerCase();
+  const ciState =
+      /pass|success/.test(ciLabel)                   ? 'passing'
+    : /fail|error/.test(ciLabel)                     ? 'failing'
+    : /running|pending|progress|queue/.test(ciLabel) ? 'pending'
+    :                                                  null;
+
+  return { prState, prNumber, prUrl, repo, featureBranch, additions, deletions, ciState };
+}
+
+function readLegacyBranchBar(bar) {
 
   // PR info. The branch row shows a "#N" link to the GitHub PR plus a
   // role="img" status icon ("Open" | "Merged" | "Closed" | "Draft"). (Older
@@ -636,8 +771,14 @@ function readModelEffortUsage() {
   // That asymmetry is the tell: prefer semantics, and treat a styling class as a
   // legacy fallback only. Model and effort are now separate sibling buttons,
   // reading "Opus 5" and "Effort: High".
+  // Current layout (2026-10-21): one chip, aria-label "Model: Opus 5.5 Medium"
+  // — model then effort level.
+  const chipLabel = document.querySelector(SEL.modelChip)?.getAttribute('aria-label') ?? '';
+  const cm = chipLabel.match(/^Model:\s*(.+?)(?:\s+(Low|Medium|High|Extra|Max))?\s*$/i);
+  if (cm) { model = cm[1].trim(); effort = cm[2] ?? null; }
+
   const MODEL_RE = /\b(Opus|Sonnet|Haiku|Fable)\b/;
-  for (const btn of document.querySelectorAll('button')) {
+  for (const btn of cm ? [] : document.querySelectorAll('button')) {
     const text = (btn.textContent ?? '').trim();
     if (!text || text.length > 40) continue;
 
@@ -719,6 +860,25 @@ function readBranchBarFresh(sessionId, prevSig, navigated) {
   if (prevSig == null) return sessionIdFromUrl() === sessionId ? bb : null;
   if (branchBarSig(bb) !== prevSig) return bb;
   return null;
+}
+
+// Re-read the bar until its signature holds still for a quiet window (or the
+// deadline passes), and return the last read. MutationObserver-driven, so a
+// throttled background tab does not stretch it — see pollUntil.
+async function settleBranchBar(bb, quietMs = 800, maxMs = 3500) {
+  const deadline = Date.now() + maxMs;
+  const sig = b => [branchBarSig(b), b?.prUrl, b?.prState, b?.ciState].join('|');
+  let last = bb;
+  while (Date.now() < deadline) {
+    let next = null;
+    const changed = await pollUntil(() => {
+      next = readBranchBar();
+      return next && sig(next) !== sig(last);
+    }, Math.min(quietMs, deadline - Date.now()));
+    if (!changed) break;
+    last = next;
+  }
+  return last;
 }
 
 // Identity signature for a branch bar. Compares more than featureBranch so two
@@ -843,8 +1003,22 @@ function readApprovalCard() {
 
   const textarea = el.querySelector(SEL.questionOther);
   const buttons  = [...el.querySelectorAll('button')];
-  const byText   = (t) => buttons.find(b => normText(b.textContent) === t) ?? null;
-  const looksLikeQuestion = !!(textarea || el.querySelector(SEL.questionDismiss) || (kbdOptions.length && !permOptions.length));
+  // Match a button by its LABEL, not its whole text: the 2026-10-21 card puts
+  // the shortcut hint inside the button ("Submit⌘Command⏎Enter"), so an exact
+  // textContent match found no Submit and every answer stopped at the pick.
+  const buttonLabel = (b) => {
+    const clone = b.cloneNode(true);
+    clone.querySelectorAll('kbd').forEach(k => k.remove());
+    return normText(clone.textContent);
+  };
+  const byText   = (t) => buttons.find(b => buttonLabel(b) === t)
+                       ?? buttons.find(b => new RegExp(`^${t}\\b`, 'i').test(buttonLabel(b)))
+                       ?? null;
+  // The "Other" option is an aria-labelled toggle (so kbdOptions skips it) and
+  // its textarea only mounts once it is pressed — find it by label, and treat
+  // its presence as "free text accepted".
+  const otherBtn = el.querySelector(SEL.questionOtherBtn);
+  const looksLikeQuestion = !!(textarea || otherBtn || el.querySelector(SEL.questionDismiss) || (kbdOptions.length && !permOptions.length));
 
   const toolName = meta?.tool?.name ?? null;
   const kind = toolName === 'AskUserQuestion' ? 'question'
@@ -861,7 +1035,8 @@ function readApprovalCard() {
     const pager = text_pager(el);
     const index = (pager?.index ?? 1) - 1;   // 0-based; the card shows index+1 / questionCount
     const q = questions[index] ?? questions[0] ?? null;
-    const otherOpt = kbdOptions.find(o => /^other$/i.test(o.label)) ?? null;
+    const otherOpt = kbdOptions.find(o => /^other$/i.test(o.label))
+                  ?? (otherBtn ? { digit: kbdOptions.length + 1, label: 'Other', button: otherBtn } : null);
     const listed   = kbdOptions.filter(o => o !== otherOpt);
     // Claude's wording wins over the (possibly truncated) rendered text; the
     // DOM only supplies the button and its digit.
@@ -878,8 +1053,8 @@ function readApprovalCard() {
       multiSelect:   q?.multiSelect === true,
       index,
       questionCount: pager?.total ?? questions.length ?? 1,
-      freeText:      textarea ? { digit: otherOpt?.digit ?? null } : null,
-      submitLabel:   submit ? normText(submit.textContent) : null,
+      freeText:      (textarea || otherBtn) ? { digit: otherOpt?.digit ?? null } : null,
+      submitLabel:   submit ? buttonLabel(submit) : null,
       selected:      listed.filter(o => o.button.getAttribute('aria-pressed') === 'true').map(o => o.digit),
     };
     controls = { other: otherOpt?.button ?? null, textarea, submit, skip: byText('Skip') };
@@ -1051,7 +1226,7 @@ async function answerQuestionCard(card, { choice, choices, text }) {
 
   if (!freeText && wants.length === 0) throw new Error(`Question card needs choice, choices, or text (options: ${available}). Nothing clicked`);
   if (wants.length > 1 && !card.question?.multiSelect) throw new Error('This question is single-select — pass one choice. Nothing clicked');
-  if (freeText && !c.textarea) throw new Error(`This question has no free-text option (options: ${available}). Nothing clicked`);
+  if (freeText && !c.textarea && !c.other) throw new Error(`This question has no free-text option (options: ${available}). Nothing clicked`);
 
   if (!freeText && wants.length === 1 && /^skip$/i.test(String(wants[0]))) {
     if (!c.skip) throw new Error('No Skip button on this question card. Nothing clicked');
@@ -1080,8 +1255,13 @@ async function answerQuestionCard(card, { choice, choices, text }) {
   }
 
   if (freeText) {
-    if (c.other) c.other.click();
-    await pollUntil(() => gone() || c.textarea.getBoundingClientRect().height > 0, 1500);
+    if (c.other && c.other.getAttribute('aria-pressed') !== 'true') c.other.click();
+    // The textarea mounts only after Other is pressed (2026-10-21), so look it
+    // up again rather than trusting the handle read before the click.
+    const ta = () => card.el.querySelector(SEL.questionOther) ?? c.textarea;
+    await pollUntil(() => gone() || (ta() && ta().getBoundingClientRect().height > 0), 1500);
+    c.textarea = ta();
+    if (!c.textarea && !gone()) throw new Error('Pressed "Other" but no answer box appeared — nothing submitted');
     if (!gone()) {
       const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
       c.textarea.focus();
@@ -1093,7 +1273,7 @@ async function answerQuestionCard(card, { choice, choices, text }) {
   await pollUntil(() => gone() || (c.submit && !c.submit.disabled), 3000);
   if (!gone()) {
     if (!c.submit) throw new Error('Selection made but the card has no Submit/Next button — nothing submitted');
-    if (c.submit.disabled) throw new Error(`Selection made but ${normText(c.submit.textContent)} stayed disabled — nothing submitted; the card may still show the selection`);
+    if (c.submit.disabled) throw new Error(`Selection made but ${card.question?.submitLabel ?? 'Submit'} stayed disabled — nothing submitted; the card may still show the selection`);
     c.submit.click();
   }
 
@@ -1160,7 +1340,7 @@ async function navigateToSession(sessionId) {
   //    app is rendering something"), NOT proof we arrived. Never treat it as
   //    arrival proof — gate on `routed`/`focused` for that.
   const rendered = await pollUntil(
-    () => document.querySelector(SEL.branchBar) || document.querySelector(SEL.chatInput),
+    () => sessionPanelEl() || document.querySelector(SEL.chatInput),
     6000,
   );
 
@@ -1300,8 +1480,12 @@ async function selectRepo(repo) {
   // full "owner/name" matches nothing and renders "No repos match" — but the
   // rendered options ARE labelled "owner/name". So: type the bare name, then
   // match on the full one.
-  const norm = s => (s || '').trim();
+  // Option labels can carry invisible characters (zero-width joins, NBSP, a
+  // selected-state glyph), so a visually exact "owner/name" failed every
+  // equality check on 2026-10-21. Strip them and compare case-insensitively.
+  const norm = s => cleanText(s).toLowerCase();
   const bare = repo.includes('/') ? repo.slice(repo.indexOf('/') + 1) : repo;
+  const want = norm(repo), wantBare = norm(bare);
 
   trigger.click();
   await pollUntil(() => document.querySelectorAll(SEL.repoOption).length > 0, 3000);
@@ -1315,21 +1499,28 @@ async function selectRepo(repo) {
 
   const matches = o => {
     const t = norm(o.textContent);
-    return t === repo || t === bare || t.endsWith(`/${bare}`);
+    return t === want || t === wantBare || t.endsWith(`/${wantBare}`);
   };
   const findMatch = () => {
     const opts = [...document.querySelectorAll(SEL.repoOption)];
-    return opts.find(o => norm(o.textContent) === repo)
-        || opts.find(o => norm(o.textContent) === bare)
-        || opts.find(o => norm(o.textContent).toLowerCase() === repo.toLowerCase())
-        || opts.find(o => norm(o.textContent).endsWith(`/${bare}`));
+    return opts.find(o => norm(o.textContent) === want)
+        || opts.find(o => norm(o.textContent).includes(want))
+        || opts.find(o => norm(o.textContent) === wantBare)
+        || opts.find(o => norm(o.textContent).endsWith(`/${wantBare}`));
   };
 
-  // Best-effort type-to-filter (the list is long and may virtualize on other
-  // accounts). Harmless when all options are already in the DOM.
-  const pop    = document.querySelector('[role="dialog"]');
-  const search = pop?.querySelector(SEL.repoSearch) || pop?.querySelector('input')
-              || document.querySelector(SEL.repoSearch) || document.querySelector('input[type="text"]');
+  // Type-to-filter. The list is NOT all in the DOM: it renders the first 90
+  // repos and searches the rest server-side, so a repo past that batch can only
+  // be reached by typing. Find the input inside the popup that holds the
+  // options — the first [role="dialog"] on /code can be a different popover
+  // (the environment menu, with radio inputs), and typing into its radio is
+  // the 2026-10-21 "90 option(s) before filtering, 90 after" failure.
+  const pop    = document.querySelector('[role="listbox"]')?.closest('[role="dialog"]')
+              ?? document.querySelector(SEL.repoOption)?.closest('[role="dialog"]')
+              ?? null;
+  const search = pop?.querySelector(SEL.repoSearch)
+              || pop?.querySelector('input[role="combobox"], input[type="text"]')
+              || document.querySelector(SEL.repoSearch);
   const setSearch = (v) => {
     if (!search) return;
     const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
@@ -1337,17 +1528,24 @@ async function selectRepo(repo) {
     search.dispatchEvent(new Event('input', { bubbles: true }));
   };
 
-  setSearch(bare);
-  if (search) await pollUntil(() => [...document.querySelectorAll(SEL.repoOption)].some(matches), 2000);
-
+  // Look in the list as rendered before typing anything: the repo is usually
+  // there already, and the search can filter it OUT ("claude-bridge" → 0
+  // options, 2026-10-21) and take longer than the wait to refill once cleared.
   let match = findMatch();
 
-  // The filter is fuzzy and can exclude everything — including the repo we
-  // want. Before concluding it is absent, clear the box and scan the full list.
   if (!match && search) {
-    setSearch('');
-    await pollUntil(() => optionCount() > 0, 2000);
+    setSearch(bare);
+    // Server-side search: give it longer than a local filter would need.
+    await pollUntil(() => [...document.querySelectorAll(SEL.repoOption)].some(matches), 4000);
     match = findMatch();
+
+    // The filter is fuzzy and can exclude everything — including the repo we
+    // want. Before concluding it is absent, clear the box and scan the full list.
+    if (!match) {
+      setSearch('');
+      await pollUntil(() => optionCount() >= unfiltered, 5000);
+      match = findMatch();
+    }
   }
   if (!match) {
     // "Not found in picker" is ambiguous: it fires both when the repo is not
@@ -1357,11 +1555,13 @@ async function selectRepo(repo) {
     // actually observed so the next reader can tell the two apart immediately.
     const seen   = [...document.querySelectorAll(SEL.repoOption)].map(o => norm(o.textContent)).filter(Boolean);
     const sample = seen.slice(0, 8).join(' | ') + (seen.length > 8 ? ' | …' : '');
+    const firstRaw = document.querySelector(SEL.repoOption)?.textContent ?? '';
     throw new Error(
       `Repo "${repo}" not found in picker — typed "${bare}"; ` +
       `search input ${search ? 'found' : 'NOT FOUND'}; ` +
       `${unfiltered} option(s) before filtering, ${seen.length} after` +
       (seen.length ? `: ${sample}` : '') + '. ' +
+      (firstRaw ? `First option raw codes: ${[...firstRaw].map(c => c.codePointAt(0).toString(16)).join(' ')}. ` : '') +
       (unfiltered === 0
         ? 'The picker rendered nothing at all — either SEL.repoOption no longer ' +
           'matches, or this account has no repos connected to the Claude GitHub app.'
@@ -1371,9 +1571,35 @@ async function selectRepo(repo) {
     );
   }
 
-  match.click();
-  // Wait for the picker to close (combobox collapses) before continuing.
+  if (match.getAttribute('aria-selected') !== 'true') match.click();
+
+  // The picker is multi-select now (aria-multiselectable, 2026-10-21): picking
+  // ADDS a repo and the list stays open. A repo left selected from an earlier
+  // composer would ride along into the new session, so un-pick every other one.
+  // Clear the filter first — a selected repo the search hid is still selected.
+  if (document.querySelector('[role="listbox"][aria-multiselectable="true"]')) {
+    if (search) {
+      setSearch('');
+      await pollUntil(() => optionCount() > 1, 2000);
+    }
+    const isTarget = o => o === match || norm(o.textContent).includes(want);
+    for (const o of [...document.querySelectorAll(SEL.repoOption)]) {
+      if (o.getAttribute('aria-selected') === 'true' && !isTarget(o)) o.click();
+    }
+  }
+
+  // Close the picker. Single-select builds closed on pick; the multi-select one
+  // needs Escape, sent to the focused search box so it reaches the popup.
+  if (repoTriggerEl()?.getAttribute('aria-expanded') === 'true') {
+    const target = search ?? document.activeElement ?? document;
+    target.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
+  }
   await pollUntil(() => repoTriggerEl()?.getAttribute('aria-expanded') !== 'true', 2000);
+
+  const now = selectedRepoFullName();
+  if (now && now.toLowerCase() !== repo.toLowerCase()) {
+    throw new Error(`Picked "${repo}" but the repo chip reads "${now}" — refusing to create against the wrong repo`);
+  }
 }
 
 // The sidebar control was renamed from "New session" to "New" (claude.ai, Aug
@@ -1447,12 +1673,14 @@ function findNewSessionButton() {
 //                requiring zero focus would make this permanently false and
 //                break create everywhere. Only a real session_… key disqualifies.
 //   branch bar — the session detail panel's bar is unmounted, not merely stale
+//                (now: neither the legacy bar nor the session rail is mounted;
+//                the rail is absent on the blank composer, verified 2026-10-21)
 //
 function onBlankComposer() {
   const focused = activeSessionId();
   return !sessionIdFromUrl()
       && !(focused && focused.startsWith('session_'))
-      && !document.querySelector(SEL.branchBar)
+      && !sessionPanelEl()
       && !!document.querySelector(SEL.chatInput);
 }
 
@@ -1471,7 +1699,7 @@ function assertOnBlankComposer(what) {
   if (onBlankComposer()) return;
   throw new Error(
     `${what} aborted — not on a blank composer (path=${location.pathname}, ` +
-    `focusedRow=${activeSessionId() ?? 'none'}, branchBar=${!!document.querySelector(SEL.branchBar)}). ` +
+    `focusedRow=${activeSessionId() ?? 'none'}, sessionPanel=${!!sessionPanelEl()}). ` +
     'Refusing to act on an existing session.'
   );
 }
@@ -1540,11 +1768,16 @@ function repoTriggerEl() {
 }
 
 // Exact "owner/name" of the currently selected repo, or null if none.
+//
+// Older builds paired the chip with a hidden JSON input; the 2026-10-21 build
+// has one "Add repository" combobox whose visible text IS the selection
+// ("pirateandfox/claude-bridge", or "Repo" when empty) and no hidden value.
 function selectedRepoFullName() {
-  const v = chipValue(repoTriggerEl());
-  return (v && typeof v === 'object' && v.owner?.login && v.name)
-    ? `${v.owner.login}/${v.name}`
-    : null;
+  const trigger = repoTriggerEl();
+  const v = chipValue(trigger);
+  if (v && typeof v === 'object' && v.owner?.login && v.name) return `${v.owner.login}/${v.name}`;
+  const text = normText(trigger?.textContent);
+  return /^[\w.-]+\/[\w.-]+$/.test(text) ? text : null;
 }
 
 // Non-destructive proof that the create path can act, not merely read. This
@@ -1667,12 +1900,16 @@ async function createSession({ model, effort, prompt, repo } = {}) {
   // A repo is now mandatory when the picker is present.
   if (repoTriggerEl()) {
     if (!repo) throw new Error('A repo is required to create a session (e.g. "owner/name")');
+    const t0 = Date.now();
     await selectRepo(repo);
+    relayLog(`create_session: repo "${repo}" selected (${Date.now() - t0}ms)`);
   }
 
   if (model || effort) {
     assertOnBlankComposer('create_session (model/effort)');
+    const t0 = Date.now();
     await setModelEffort(model, effort);
+    relayLog(`create_session: model/effort step done (${Date.now() - t0}ms, hidden=${document.hidden})`);
     // Both pickers are overlays. Injecting while one is still mounted lets it
     // swallow the Enter that submits — the prompt then sits in the composer and
     // no session is ever created (2026-08-08). Wait for them to unmount.
@@ -1754,6 +1991,12 @@ async function setModelEffort(model, effort) {
   // the model chip is simply its sibling. No document-wide search for a model
   // name, and no reliance on offsetParent (a fixed-position footer reports null
   // even while plainly visible).
+  // Current layout: one model chip whose menu holds the models and an "Effort"
+  // submenu. The two-chip code below is the legacy layout.
+  await pollUntil(() => document.querySelector(SEL.modelChip), 5000);
+  const chip = document.querySelector(SEL.modelChip);
+  if (chip) return setModelEffortChip(chip, model, effort);
+
   const EFFORT_RE = /^effort\b/i;
   const MODEL_RE  = /\b(opus|sonnet|haiku|fable)\b/i;
   const byLabel   = (root, re) =>
@@ -1836,16 +2079,120 @@ async function setModelEffort(model, effort) {
   }
 }
 
+// Model chip menu (2026-10-21): menuitemradio per model, labelled with a
+// trailing shortcut digit ("Fable 5.1 2"), and a menuitem "Effort Medium" that
+// opens a submenu of menuitemradio levels ("Low", "Medium Recommended", …).
+// Visible text with the invisible parts removed. Menu and picker labels carry
+// zero-width characters, NBSPs and icon glyphs that trim() keeps, so a label
+// that logs as "Low" or "Sonnet 5.5" failed exact and prefix matches
+// (2026-10-21, both the repo picker and the model/effort menus).
+function cleanText(s) {
+  return (s || '')
+    // Every format character (\p{Cf}): zero-width chars, soft hyphen, BOM and
+    // the bidi isolates (U+2066–2069) React i18n wraps strings in — JSON.stringify
+    // does not escape those, so they hid in logs as "Low".
+    // Private-use too (\p{Co}): the selected menu item ends in an icon-font
+    // checkmark, U+E03B ("Low\ue03b"), and "Max" carries U+E08F.
+    .replace(/[\p{Cf}\p{Co}]/gu, '')
+    .replace(/[\s\u00a0]+/g, ' ')
+    .replace(/^[^\p{L}\p{N}]+/u, '')
+    .trim();
+}
+
+async function setModelEffortChip(chip, model, effort) {
+  // textContent runs an item's spans together: "Sonnet 5.53" (name + shortcut
+  // digit), "MediumRecommended", "Max3.5× or more usage". So after the wanted
+  // prefix accept: end, whitespace, an Uppercase run-on word, or one trailing
+  // shortcut digit — never "." (so "Opus 5" can't grab "Opus 5.5").
+  const pick = (items, want) => {
+    const w = String(want).trim().toLowerCase();
+    return items.find(i => {
+      const t = cleanText(i.textContent);
+      if (!t.toLowerCase().startsWith(w)) return false;
+      const rest = t.slice(w.length);
+      // A wanted name ending in a letter can't be extended by a digit, so a
+      // digit there is a run-on label ("Max3.5×"); after a version, only a
+      // lone trailing shortcut digit is.
+      return /^(?:$|\s|[A-Z]|\d$)/.test(rest) || (/[a-z]$/.test(w) && /^\d/.test(rest));
+    }) ?? null;
+  };
+  // Code points too: invisible characters don't show up in the label itself.
+  const labels = items => items.map(i => {
+    const t = i.textContent ?? '';
+    const odd = [...t].filter(c => !/[\p{L}\p{N}\p{P}\p{S} ]/u.test(c)).map(c => 'U+' + c.codePointAt(0).toString(16).padStart(4, '0'));
+    return JSON.stringify(t) + (odd.length ? ` [${odd.join(' ')}]` : '');
+  }).join(', ') || 'none';
+  const openMenu = async () => {
+    const t0 = Date.now();
+    const r = await openMenuFrom(chip);
+    relayLog(`setModelEffort: chip menu ${r.ok ? `opened via ${r.how}` : `did not open (${r.diag})`} in ${Date.now() - t0}ms`);
+    return r.ok;
+  };
+
+  const problems = [];
+  if (model) {
+    if (!await openMenu()) problems.push(`model "${model}" (menu never opened)`);
+    else {
+      const items = [...document.querySelectorAll('[role="menu"] [role="menuitemradio"]')];
+      const item  = pick(items, model);
+      if (!item) problems.push(`model "${model}" (offered: ${labels(items)})`);
+      else if (!await activateMenuItem(item, () => !item.isConnected || item.getAttribute('aria-checked') === 'true'))
+        problems.push(`model "${model}" (item ignored every press)`);
+      await closeMenus();
+    }
+  }
+  if (effort) {
+    if (!await openMenu()) problems.push(`effort "${effort}" (menu never opened)`);
+    else {
+      const menu = document.querySelector('[role="menu"]');
+      const sub  = [...menu.querySelectorAll('[role="menuitem"][aria-haspopup="menu"]')]
+        .find(i => /^effort/i.test(cleanText(i.textContent)));
+      if (!sub) problems.push(`effort "${effort}" (no Effort submenu)`);
+      else {
+        // Submenus open on hover.
+        const o = { bubbles: true, pointerType: 'mouse', isPrimary: true, pointerId: 1, view: window };
+        sub.dispatchEvent(new PointerEvent('pointerenter', o));
+        sub.dispatchEvent(new PointerEvent('pointermove', o));
+        sub.dispatchEvent(new MouseEvent('mousemove', o));
+        const subOpen = () => document.querySelectorAll('[role="menu"]').length > 1;
+        if (!await pollUntil(subOpen, 1000)) pressControl(sub);
+        if (!await pollUntil(subOpen, 1000)) {
+          sub.focus();
+          sub.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true }));
+          await pollUntil(subOpen, 1000);
+        }
+        const subMenu = [...document.querySelectorAll('[role="menu"]')].find(m => m !== menu);
+        const items = subMenu ? [...subMenu.querySelectorAll('[role="menuitemradio"]')] : [];
+        const item  = pick(items, effort);
+        if (!item) problems.push(`effort "${effort}" (offered: ${labels(items)})`);
+        else if (!await activateMenuItem(item, () => !item.isConnected || item.getAttribute('aria-checked') === 'true'))
+          problems.push(`effort "${effort}" (item ignored every press)`);
+      }
+      await closeMenus();
+    }
+  }
+  if (problems.length) {
+    relayLog(`setModelEffort: could not set ${problems.join('; ')} — session continues on account defaults`);
+  }
+}
+
 async function archiveSession(sessionId) {
   const row = await requireSessionRow(sessionId);
 
-  row.querySelector(SEL.rowAction)?.click();
-  await sleep(200);
+  // Base UI menu — see pressControl.
+  const trigger = row.querySelector(SEL.rowAction);
+  if (trigger) await openMenuFrom(trigger);
 
   for (const item of document.querySelectorAll('[role="menuitem"]')) {
-    const label = item.querySelector('.flex-1')?.textContent?.trim();
-    if (label === 'Archive') { item.click(); return; }
+    const label = (item.querySelector('.flex-1')?.textContent ?? item.textContent ?? '').trim();
+    if (/^archive\b/i.test(label)) {
+      // A taken press closes the menu.
+      if (await activateMenuItem(item, () => !item.isConnected)) return;
+      await closeMenus();
+      throw new Error('Archive menu item ignored every press');
+    }
   }
+  await closeMenus();
   throw new Error('Archive option not found');
 }
 
@@ -2187,7 +2534,9 @@ async function createPr(sessionId) {
   // every session that actually had one. Scoping to the branch bar also shrinks
   // the document-global blast radius the comment above worries about, since
   // that bar belongs to the session we just proved we are parked on.
-  const bar = document.querySelector(SEL.branchBar);
+  // On the rail layout the button sits in the pullRequests card.
+  const bar = document.querySelector(SEL.branchBar)
+           ?? document.querySelector(`${SEL.sessionRail} ${SEL.railPrCard}`);
   const scope = bar ?? document;
   const btn = scope.querySelector('button[aria-label="Create PR"]')
     ?? [...scope.querySelectorAll('button')]
@@ -2207,6 +2556,14 @@ async function setCiOptions(sessionId, { autofix, automerge }) {
   // Global CI button + global checkboxes — same gate as create_pr, or auto-merge
   // gets flipped on someone else's session.
   assertParkedOn(sessionId, 'set_ci_options');
+
+  // Rail layout (2026-10-21): the toggles left the CI popover — it now only
+  // lists check results — and became menuitemcheckbox entries "Auto-fix" and
+  // "Merge when ready" in the PR's "More options" menu.
+  const prCard = document.querySelector(`${SEL.sessionRail} ${SEL.railPrCard}`);
+  if (prCard && !document.querySelector(SEL.branchBar)) {
+    return setCiOptionsRail(prCard, sessionId, { autofix, automerge });
+  }
 
   // Prefer the semantic label over the colour dot (see readBranchBar). Note the
   // button only exists once checks have actually run — "not found" on a PR with
@@ -2232,7 +2589,166 @@ async function setCiOptions(sessionId, { autofix, automerge }) {
   document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+// Rail layout (2026-10-21). The menu's checkmarks cannot be trusted from the
+// bridge's tab: it is backgrounded and long-lived, so its copy of the toggles
+// goes stale (a change made in another tab never reached it), and presses on the
+// items sometimes did not reflect at all — so "press until aria-checked flips"
+// either did nothing or flipped the setting several times. Verified instead:
+//
+//   Auto-fix         = POST /v1/code/github/(un)subscribe-pull-request
+//                      { repo, session_id, pr_number } — idempotent set, 200 {}.
+//                      Confirmed by reloading the page after each call.
+//   Merge when ready = auto_merge_enabled on the PR, read from
+//                      POST /v1/code/github/get-batch-branch-status. Its write
+//                      endpoint is not known, so it is still a menu press — but
+//                      every retry re-reads the API first, so a press that did
+//                      land is never undone by the next one.
+const GITHUB_API_HEADERS = { ...EVENTS_HEADERS, 'content-type': 'application/json' };
+
+async function githubApi(path, body) {
+  const resp = await fetchWithTimeout(`/v1/code/github/${path}`, {
+    method: 'POST', credentials: 'include', headers: GITHUB_API_HEADERS, body: JSON.stringify(body),
+  }, 10000);
+  if (resp.status === 401 || resp.status === 403) throw bridgeError('NOT_AUTHENTICATED', `GitHub API ${path}: ${resp.status}`);
+  if (!resp.ok) throw new Error(`GitHub API ${path}: ${resp.status}`);
+  return resp.json().catch(() => ({}));
+}
+
+async function readPrStatus(sessionId, repo, branch) {
+  const d = await githubApi('get-batch-branch-status?caller=epitaxy-cichecks', {
+    repo_branches: [{ repo, branch }], discover_session_prs: true, session_ids: [sessionId], include_ci_status: true,
+  });
+  return d?.branch_statuses?.[0]?.pull_request ?? null;
+}
+
+async function setCiOptionsRail(prCard, sessionId, { autofix, automerge }) {
+  const meta = await readSessionMeta(sessionId);
+  const repo = meta?.repo, branch = meta?.branch;
+  if (!repo || !branch) throw new Error('Could not read this session\'s repo and branch from the API');
+  const pr = await readPrStatus(sessionId, repo, branch);
+  if (!pr?.number) throw new Error('No pull request on this session — open one first');
+
+  if (autofix !== undefined) {
+    await githubApi(autofix ? 'subscribe-pull-request' : 'unsubscribe-pull-request',
+      { repo, session_id: sessionId, pr_number: pr.number });
+  }
+
+  if (automerge !== undefined && !!pr.auto_merge_enabled !== automerge) {
+    const more = prCard.querySelector(SEL.prMoreBtn);
+    if (!more) throw new Error('PR "More options" button not found');
+    const methods = document.hidden ? ['keyboard', 'pointer', 'click'] : ['pointer', 'keyboard', 'click'];
+    let done = false;
+    for (const how of methods) {
+      const opened = await openMenuFrom(more);
+      if (!opened.ok) throw new Error(`PR "More options" menu did not open (${opened.diag})`);
+      const item = [...document.querySelectorAll('[role="menu"] [role="menuitemcheckbox"]')]
+        .find(i => /\b(merge when ready|auto-merge)\b/i.test(i.textContent ?? ''));
+      if (!item) { await closeMenus(); throw new Error('"Merge when ready" not in the PR menu'); }
+      if (how === 'pointer') pressControl(item);
+      else if (how === 'keyboard') { item.focus(); item.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })); }
+      else item.click();
+      await closeMenus();
+      // The API, not the menu, says whether it took. No sleep() between reads:
+      // in a hidden tab one can last a minute — the round trips pace the loop.
+      const deadline = Date.now() + 5000;
+      for (let i = 0; i < 12 && Date.now() < deadline; i++) {
+        const now = await readPrStatus(sessionId, repo, branch);
+        if (!!now?.auto_merge_enabled === automerge) { done = true; break; }
+      }
+      if (done) { relayLog(`set_ci_options: merge-when-ready set via ${how}`); break; }
+    }
+    if (!done) throw new Error(`Could not turn "Merge when ready" ${automerge ? 'on' : 'off'} — the PR still reports auto_merge_enabled=${!automerge}`);
+  }
+}
+
+// Hidden tabs throttle setTimeout to ~1/min; pollUntil's deadline is not.
+function sleep(ms) {
+  if (!document.hidden) return new Promise(r => setTimeout(r, ms));
+  return pollUntil(() => false, ms).then(() => undefined);
+}
+
+// Press a control the way a mouse does. claude.ai's menus are Base UI, whose
+// triggers ignore a bare .click() and a lone pointerdown — only the full
+// pointer + mouse sequence opens them (verified 2026-10-21 on the PR card's
+// "More options" and the model chip).
+function pressControl(el) {
+  const o = { bubbles: true, cancelable: true, button: 0, buttons: 1, pointerType: 'mouse', isPrimary: true, pointerId: 1, view: window };
+  el.dispatchEvent(new PointerEvent('pointerdown', o));
+  el.dispatchEvent(new MouseEvent('mousedown', o));
+  el.dispatchEvent(new PointerEvent('pointerup', { ...o, buttons: 0 }));
+  el.dispatchEvent(new MouseEvent('mouseup', { ...o, buttons: 0 }));
+  el.dispatchEvent(new MouseEvent('click', { ...o, buttons: 0 }));
+}
+
+// A failed pollUntil only ends on its timer, and a hidden tab's timers fire
+// about once a minute — so each pointer attempt that the background tab ignores
+// costs ~60s (create_session spent 2 min in setModelEffort, 2026-10-21). When
+// hidden, lead with the keyboard path, which is what works there.
+function keyboardFirstWhenHidden(attempts) {
+  if (!document.hidden) return attempts;
+  const kb = ([how]) => how.startsWith('keyboard');
+  return [...attempts.filter(kb), ...attempts.filter(a => !kb(a))];
+}
+
+// Open the menu a Base UI trigger owns. pressControl opens it in a foreground
+// tab; the bridge's tab is usually in the background, where the same sequence
+// failed once (2026-10-21) for reasons not yet pinned down — so fall back to the
+// keyboard path and a bare click, and say what was seen if nothing worked.
+async function openMenuFrom(trigger) {
+  const isOpen = () => trigger.getAttribute('aria-expanded') === 'true' && !!document.querySelector('[role="menu"]');
+  const attempts = [
+    ['pointer', () => pressControl(trigger)],
+    // ArrowDown and Enter are separate attempts: the menu opens asynchronously,
+    // so an Enter sent right behind ArrowDown can toggle it straight shut.
+    ['keyboard', () => {
+      trigger.focus();
+      trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }));
+    }],
+    ['keyboard-enter', () => {
+      trigger.focus();
+      trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    }],
+    ['click', () => trigger.click()],
+  ];
+  for (const [how, fire] of keyboardFirstWhenHidden(attempts)) {
+    fire();
+    if (await pollUntil(isOpen, 1000)) return { ok: true, how };
+  }
+  return {
+    ok: false,
+    diag: `expanded=${trigger.getAttribute('aria-expanded')} menus=${document.querySelectorAll('[role="menu"]').length} ` +
+          `visibility=${document.visibilityState} focus=${document.hasFocus()} connected=${trigger.isConnected}`,
+  };
+}
+
+// Activate a menu item, trying the same three paths as openMenuFrom, until
+// done() holds. Returns how it got there, or null if nothing took. Pointer
+// presses on items are silently ignored in the bridge's background tab too.
+async function activateMenuItem(item, done) {
+  const attempts = [
+    ['pointer', () => pressControl(item)],
+    ['keyboard', () => {
+      item.focus();
+      item.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    }],
+    ['click', () => item.click()],
+  ];
+  for (const [how, fire] of keyboardFirstWhenHidden(attempts)) {
+    if (!item.isConnected) break;
+    fire();
+    if (await pollUntil(done, 800)) return how;
+  }
+  return done() ? 'unknown' : null;
+}
+
+// Close every open Base UI menu. They listen for Escape on the focused element,
+// which is inside the menu while it is open.
+async function closeMenus() {
+  for (let i = 0; i < 3 && document.querySelector('[role="menu"]'); i++) {
+    (document.activeElement ?? document).dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    await pollUntil(() => !document.querySelector('[role="menu"]'), 500);
+  }
+}
 
 // Throttle-immune wait. Resolves true as soon as predicate() is satisfied, or
 // false after maxMs.
@@ -2267,6 +2783,20 @@ function pollUntil(predicate, maxMs) {
     obs.observe(document.documentElement, { childList: true, subtree: true, attributes: true, characterData: true });
     iv = setInterval(check, 200);                 // backstop (throttled in bg, harmless)
     timer = setTimeout(() => finish(false), maxMs); // coarse deadline backstop
+    // In a hidden tab that timer can fire a minute late, so a wait that FAILS
+    // lasted ~60s instead of maxMs — and the menu fallbacks chain several such
+    // waits, which timed create_session out at 150s (2026-10-21). MessageChannel
+    // messages are not throttled: tick through them until the deadline.
+    if (document.hidden) {
+      const ch = new MessageChannel();
+      let last = 0;
+      ch.port1.onmessage = () => {
+        const now = Date.now();
+        if (now - last >= 25) { last = now; check(); }
+        if (!done) ch.port2.postMessage(0); else ch.port1.close();
+      };
+      ch.port2.postMessage(0);
+    }
   });
 }
 
@@ -2429,8 +2959,16 @@ chrome.runtime.onMessage.addListener((msg) => {
                 || approvalCardFresh(msg.sessionId, prevCard, navigated)
                 || (routeConfirmed
                     && document.querySelector(SEL.chatInput)
-                    && !document.querySelector(SEL.branchBar));
+                    && !readBranchBar());
             }, 4000);
+
+            // The rail fills in pieces: the environment card first, then the
+            // pullRequests card (PR link, diff, CI) a beat later. Returning on
+            // the first fresh read reported a PR session as "no PR, +0 −0"
+            // (2026-10-21). Wait until the bar stops changing.
+            if (branchBar && !document.querySelector(SEL.branchBar)) {
+              branchBar = await settleBranchBar(branchBar);
+            }
 
             // Now read model/effort/usage — inside the lock, panel confirmed on
             // this session. model/effort are per-session (the composer's selector)

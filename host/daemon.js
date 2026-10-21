@@ -514,13 +514,13 @@ const TOOLS = [
   },
   {
     name: 'claude_session_set_ci_options',
-    description: 'Set the CI monitoring checkboxes for a session that has an open PR.',
+    description: 'Set the PR\'s CI toggles ("Auto-fix" and "Merge when ready", in the PR\'s menu in the session rail) for a session that has an open PR.',
     inputSchema: {
       type: 'object',
       properties: {
         session_id: { type: 'string' },
-        autofix:    { type: 'boolean', description: 'Enable "Auto-fix CI & address comments"' },
-        automerge:  { type: 'boolean', description: 'Enable "Auto-merge when ready"' },
+        autofix:    { type: 'boolean', description: 'Enable "Auto-fix" (fix CI failures and address review comments)' },
+        automerge:  { type: 'boolean', description: 'Enable "Merge when ready"' },
       },
       required: ['session_id'],
     },
